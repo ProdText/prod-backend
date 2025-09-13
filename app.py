@@ -9,7 +9,14 @@ from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
 from dotenv import load_dotenv
+
+# Import our new services and models
+from models.message import WebhookPayload, MessageResponse
+from services.auth_user_service import AuthUserService
+from services.message_processor import MessageProcessor
+from services.bluebubbles_client import get_bluebubbles_client
 
 # Load environment variables
 load_dotenv()
@@ -32,7 +39,19 @@ supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 if not supabase_url or not supabase_service_role_key:
     raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
 
-supabase: Client = create_client(supabase_url, supabase_service_role_key)
+supabase_client = create_client(
+    supabase_url, 
+    supabase_service_role_key,
+    options=ClientOptions(
+        auto_refresh_token=False,
+        persist_session=False
+    )
+)
+
+# Initialize services with auth integration
+auth_user_service = AuthUserService(supabase_client)
+bluebubbles_client = get_bluebubbles_client()
+message_processor = MessageProcessor(auth_user_service, bluebubbles_client)
 
 # Optional webhook shared secret for validation
 WEBHOOK_SHARED_SECRET = os.getenv("WEBHOOK_SHARED_SECRET")
@@ -44,6 +63,7 @@ class HealthResponse(BaseModel):
     service: str
 
 
+# Legacy response model for backwards compatibility
 class WebhookResponse(BaseModel):
     success: bool
     event_id: str
@@ -62,38 +82,6 @@ def validate_shared_secret(x_shared_secret: Optional[str]) -> bool:
     return x_shared_secret == WEBHOOK_SHARED_SECRET
 
 
-async def insert_webhook_event(
-    event_id: str,
-    event_type: str,
-    headers: Dict[str, Any],
-    payload: Dict[str, Any]
-) -> bool:
-    """
-    Insert webhook event into Supabase with graceful idempotency handling.
-    Returns True if successful, False if duplicate (idempotent).
-    """
-    try:
-        # Prepare the event data
-        event_data = {
-            "id": event_id,
-            "source": "bluebubbles",
-            "event_type": event_type,
-            "headers": headers,
-            "payload": payload
-        }
-        
-        # Insert with upsert to handle duplicates gracefully
-        result = supabase.table("bb_events").upsert(
-            event_data,
-            on_conflict="id"
-        ).execute()
-        
-        logger.info(f"Successfully processed event {event_id} (type: {event_type})")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to insert event {event_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 @app.get("/healthz", response_model=HealthResponse)
@@ -106,7 +94,7 @@ async def health_check():
     )
 
 
-@app.post("/webhooks/bluebubbles", response_model=WebhookResponse)
+@app.post("/webhooks/bluebubbles", response_model=MessageResponse)
 async def receive_bluebubbles_webhook(
     request: Request,
     x_shared_secret: Optional[str] = Header(None, alias="X-Shared-Secret")
@@ -118,11 +106,11 @@ async def receive_bluebubbles_webhook(
     1. Reads the raw request body
     2. Validates JSON format
     3. Optionally checks X-Shared-Secret header
-    4. Generates event ID by hashing raw body
-    5. Stores event in Supabase with idempotency
+    4. Processes message and manages user state
+    5. Sends response back to BlueBubbles if applicable
     """
     
-    # Read raw body for hashing
+    # Read raw body
     raw_body = await request.body()
     
     if not raw_body:
@@ -135,36 +123,36 @@ async def receive_bluebubbles_webhook(
     
     # Parse JSON payload
     try:
-        payload = json.loads(raw_body)
+        payload_dict = json.loads(raw_body)
+        webhook_payload = WebhookPayload(**payload_dict)
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in request body: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+    except Exception as e:
+        logger.error(f"Invalid webhook payload structure: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid payload: {str(e)}")
     
-    # Generate event ID from raw body hash
+    # Generate event ID for logging
     event_id = generate_event_id(raw_body)
-    
-    # Extract event type from payload
-    event_type = payload.get("type", "unknown")
-    
-    # Convert headers to dict for storage
-    headers_dict = dict(request.headers)
+    event_type = webhook_payload.type
     
     # Log the incoming webhook
     logger.info(f"Received BlueBubbles webhook - Event ID: {event_id}, Type: {event_type}")
     
-    # Insert event into database
-    await insert_webhook_event(
-        event_id=event_id,
-        event_type=event_type,
-        headers=headers_dict,
-        payload=payload
-    )
-    
-    return WebhookResponse(
-        success=True,
-        event_id=event_id,
-        message=f"Successfully processed {event_type} event"
-    )
+    # Process the message
+    try:
+        result = await message_processor.process_webhook_message(webhook_payload)
+        
+        logger.info(f"Processed webhook {event_id}: {result.message}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error processing webhook {event_id}: {str(e)}")
+        return MessageResponse(
+            success=False,
+            user_guid="unknown",
+            message=f"Processing error: {str(e)}"
+        )
 
 
 @app.exception_handler(Exception)
