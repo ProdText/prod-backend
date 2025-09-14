@@ -19,7 +19,10 @@ logger = logging.getLogger(__name__)
 # Initialize Anthropic client with error handling
 anthropic = None
 api_key = os.getenv("ANTHROPIC_API_KEY")
+logger.info(f"ANTHROPIC_API_KEY environment variable: {'SET' if api_key else 'NOT SET'}")
 if api_key:
+    logger.info(f"API key length: {len(api_key)} characters")
+    logger.info(f"API key starts with: {api_key[:10]}...")
     try:
         from anthropic import Anthropic
         anthropic = Anthropic(api_key=api_key)
