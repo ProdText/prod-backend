@@ -72,13 +72,37 @@ class MessageProcessor:
             # Check if user already exists by phone number
             existing_user = await self.auth_user_service.get_user_by_phone_number(phone_number)
             
+            # Initialize response variables
+            response_text = None
+            response_texts = None
+            
             if existing_user:
-                # Check if user has completed email verification
+                # Check if user has completed BOTH email verification AND onboarding
                 if existing_user.profile.email_verified and existing_user.profile.onboarding_completed:
                     # Fully verified existing user - handle AI conversation
                     response_texts = await self._handle_ai_conversation(
                         existing_user, message_data.text, phone_number
                     )
+                elif existing_user.profile.email_verified and not existing_user.profile.onboarding_completed:
+                    # Email verified but onboarding not completed - check integrations and potentially complete
+                    from services.integration_service import IntegrationService
+                    integration_service = IntegrationService(self.auth_user_service.supabase)
+                    
+                    # Check if integrations are complete and auto-complete onboarding if so
+                    onboarding_completed = await integration_service.check_and_complete_onboarding(existing_user.profile.id)
+                    
+                    if onboarding_completed:
+                        # Onboarding was just completed - handle AI conversation
+                        response_texts = await self._handle_ai_conversation(
+                            existing_user, message_data.text, phone_number
+                        )
+                    else:
+                        # Still need integrations - prompt for dashboard
+                        response_text = (
+                            "🔗 Complete your setup to start using the service:\n"
+                            "https://dashboard.example.com\n\n"
+                            "Once you've set up your integrations, you'll be able to chat with me!"
+                        )
                 else:
                     # Existing user but email not verified - continue onboarding workflow
                     response_text = await self._handle_existing_user_workflow(message_data, existing_user, phone_number, chat_identifier)
@@ -177,62 +201,139 @@ class MessageProcessor:
             
             logger.info(f"Existing user workflow - State: {existing_user.profile.onboarding_state}, Message: '{message_text}'")
             
+            # Check for restart command first
+            if message_text.lower() == "restart":
+                return await self._restart_verification_process(existing_user)
+            
             # PRIORITY 1: Always check for OTP code first, regardless of state
-            if self._is_valid_otp_code(message_text):
-                logger.info(f"Valid OTP code detected: '{message_text}', proceeding to verification")
-                return await self._handle_otp_verification_existing(existing_user, message_text)
             
-            # PRIORITY 2: State-based logic only if not an OTP
-            if existing_user.profile.onboarding_state == "awaiting_email_otp":
-                # User is awaiting OTP but didn't provide valid one
-                return (
-                    "❌ Please enter the 6-digit verification code from your email.\n\n"
-                    "Example: 123456"
-                )
+            # Check if user provided email in their message first
+            extracted_email = self._extract_email_from_text(message_text)
+            if extracted_email:
+                # User provided email - process it regardless of current state
+                logger.info(f"DEBUG: User provided email {extracted_email} in message, processing directly")
+                return await self._handle_email_provided_existing(existing_user, extracted_email)
             
-            # Check if email already exists in profile and user hasn't started OTP process
-            if existing_user.profile.email and existing_user.profile.onboarding_state in ["not_started", "awaiting_email"]:
-                # Email exists but not yet waiting for OTP - send OTP
-                await self._update_onboarding_state(existing_user.profile.id, "awaiting_email_otp")
-                
-                # Send OTP to existing email
-                otp_result = await self._send_email_otp(existing_user.profile.email)
-                
-                if otp_result["success"]:
-                    return (
-                        f"📧 I've sent a verification code to {existing_user.profile.email}.\n\n"
-                        "Please check your email and reply with the 6-digit code you received."
-                    )
-                else:
-                    return "❌ Sorry, I couldn't send the verification email. Please try again later."
+            # Check if email already exists in profile and current state
+            if existing_user.profile.email and existing_user.profile.onboarding_state != "awaiting_email_otp":
+                # Email exists but not yet waiting for OTP - send OTP (only if it's not a temp email)
+                if not existing_user.profile.email.startswith("temp_"):
+                    await self._update_onboarding_state(existing_user.profile.id, "awaiting_email_otp")
+                    
+                    otp_result = await self._send_email_otp(existing_user.profile.email)
+                    if otp_result["success"]:
+                        return (
+                            f"📧 I've sent a verification code to {existing_user.profile.email}.\n\n"
+                            "Please check your email and reply with the 6-digit code you received.\n\n"
+                            "💡 Type 'restart' at any time to restart the verification process with a new email."
+                        )
+                    else:
+                        return "❌ Sorry, I couldn't send the verification email. Please try again later."
             
             # Check current onboarding state for users without email
             if existing_user.profile.onboarding_state == "not_started":
-                # User exists but hasn't started onboarding - prompt for email
-                await self._update_onboarding_state(existing_user.profile.id, "awaiting_email")
-                return (
-                    "👋 Welcome back! To get started, I need to verify your email address.\n\n"
-                    "Please reply with your email address."
-                )
+                # User exists but hasn't started onboarding - check if they provided email in this message
+                extracted_email = self._extract_email_from_text(message_text)
+                logger.info(f"DEBUG: not_started state - Text: '{message_text}', Extracted email: '{extracted_email}'")
+                if extracted_email:
+                    # User provided email in their message - process it directly
+                    logger.info(f"DEBUG: Processing extracted email {extracted_email} for existing user")
+                    return await self._handle_email_provided_existing(existing_user, extracted_email)
+                else:
+                    # No email found - prompt for email
+                    logger.info(f"DEBUG: No email found, updating state to awaiting_email")
+                    await self._update_onboarding_state(existing_user.profile.id, "awaiting_email")
+                    return (
+                        "👋 Welcome back! To get started, I need to verify your email address.\n\n"
+                        "Please reply with your email address.\n\n"
+                        "💡 Type 'restart' at any time to restart the verification process."
+                    )
             elif existing_user.profile.onboarding_state == "awaiting_email":
-                # User should provide email
-                if self._is_valid_email(message_text):
-                    return await self._handle_email_provided_existing(existing_user, message_text)
+                # User should provide email - try to extract email from natural language
+                extracted_email = self._extract_email_from_text(message_text)
+                if extracted_email:
+                    return await self._handle_email_provided_existing(existing_user, extracted_email)
                 else:
                     return (
-                        "❌ Please provide a valid email address.\n\n"
-                        "Example: your.email@example.com"
+                        "❌ I couldn't find a valid email address in your message.\n\n"
+                        "Please provide your email address (e.g., your.email@example.com)\n\n"
+                        "💡 Type 'restart' to start over."
+                    )
+            elif existing_user.profile.onboarding_state == "awaiting_email_otp":
+                # User should provide OTP code, but also check if they provided a new email
+                otp_code = self._extract_otp_from_text(message_text)
+                extracted_email = self._extract_email_from_text(message_text)
+                
+                logger.info(f"Email extraction debug - Text: '{message_text}', Extracted email: '{extracted_email}', OTP: '{otp_code}'")
+                
+                if otp_code:
+                    return await self._handle_otp_verification_existing(existing_user, otp_code)
+                elif extracted_email:
+                    # User provided a new email - update and send new OTP
+                    logger.info(f"Processing email {extracted_email} for existing user")
+                    return await self._handle_email_provided_existing(existing_user, extracted_email)
+                else:
+                    return (
+                        "Please enter the 6-digit verification code from your email.\n\n"
+                        "Example: 123456\n\n"
+                        "💡 Type 'restart' to restart the verification process with a new email."
                     )
             else:
                 # Unknown state - restart onboarding
-                return (
-                    "👋 Welcome! To get started, I need to verify your email address.\n\n"
-                    "Please reply with your email address."
-                )
+                return await self._restart_verification_process(existing_user)
                 
         except Exception as e:
             logger.error(f"Error in existing user workflow: {str(e)}")
-            return "❌ Sorry, there was an error processing your request. Please try again."
+            return "❌ Sorry, there was an error processing your message. Please try again or type 'restart' to start over."
+
+    def _extract_email_from_text(self, text: str) -> Optional[str]:
+        """Extract email address from natural language text using RegEx"""
+        import re
+        # Email regex pattern - matches most common email formats
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        matches = re.findall(email_pattern, text)
+        
+        if matches:
+            # Return the first valid email found
+            return matches[0]
+        return None
+    
+    def _extract_otp_from_text(self, text: str) -> Optional[str]:
+        """Extract 6-digit OTP code from text"""
+        import re
+        # Look for 6 consecutive digits
+        otp_pattern = r'\b\d{6}\b'
+        matches = re.findall(otp_pattern, text)
+        
+        if matches:
+            return matches[0]
+        return None
+    
+    async def _restart_verification_process(self, existing_user: AuthUserWithProfile) -> str:
+        """Restart the verification process from the beginning"""
+        try:
+            # Reset user state to awaiting_email and clear existing email
+            await self._update_onboarding_state(existing_user.profile.id, "awaiting_email")
+            
+            # Clear email from profile
+            result = self.auth_user_service.supabase.table("user_profiles").update({
+                "email": None
+            }).eq("id", existing_user.profile.id).execute()
+            
+            if not result.data:
+                logger.error(f"Failed to clear email for user {existing_user.profile.id}")
+            
+            logger.info(f"Restarted verification process for user {existing_user.profile.id}")
+            
+            return (
+                "🔄 Verification process restarted!\n\n"
+                "Please provide your email address to begin verification.\n\n"
+                "💡 Type 'restart' at any time to restart the process again."
+            )
+            
+        except Exception as e:
+            logger.error(f"Error restarting verification process: {str(e)}")
+            return "❌ Sorry, there was an error restarting the verification process. Please try again."
 
     async def _handle_email_provided_existing(self, existing_user, email: str) -> str:
         """Handle when existing user provides their email address"""
@@ -336,62 +437,66 @@ class MessageProcessor:
     async def _handle_new_user_workflow(self, message: BlueBubblesMessage, user_guid: str, phone_number: str, chat_identifier: str) -> str:
         """
         Handle the complete new user onboarding workflow
-        
-        Steps:
-        1. First message: Ask for email
-        2. Email provided: Create user in Supabase and send OTP
-        3. OTP provided: Verify and complete onboarding
         """
-        message_text = (message.text or "").strip()
-        
-        # Check if this looks like an email address
-        if "@" in message_text and "." in message_text.split("@")[-1]:
-            # User provided email - create account and send OTP
-            return await self._handle_email_provided(user_guid, phone_number, chat_identifier, message_text)
-        
-        # Check if this looks like an OTP code (6 digits)
-        elif message_text.isdigit() and len(message_text) == 6:
-            # User provided OTP - verify it
-            return await self._handle_otp_provided(phone_number, message_text)
-        
-        # First message or invalid input - ask for email
-        else:
-            return (
-                "👋 Welcome! To get started, I need to verify your email address.\n\n"
-                "Please reply with your email address and I'll send you a verification code."
-            )
-    
-    async def _handle_email_provided(self, user_guid: str, phone_number: str, chat_identifier: str, email: str) -> str:
-        """Handle when user provides their email address"""
         try:
-            # Create user in Supabase with the provided email
-            user_with_profile = await self.auth_user_service.create_authenticated_user(
-                bluebubbles_guid=user_guid,
-                phone_number=phone_number,
-                email=email,
-                chat_identifier=chat_identifier
-            )
+            message_text = getattr(message, 'text', '').strip()
             
-            # Store email in user_profiles table and update state to awaiting_email_otp
-            await self._store_email_in_profile(user_with_profile.profile.id, email)
-            await self._update_onboarding_state(user_with_profile.profile.id, "awaiting_email_otp")
-            
-            # Send OTP to the email using Supabase Auth
-            otp_result = await self._send_email_otp(email)
-            
-            if otp_result["success"]:
-                logger.info(f"Email OTP sent to {email} for user {user_guid}")
+            # Check for restart command
+            if message_text.lower() == "restart":
                 return (
-                    f"📧 Perfect! I've sent a verification code to {email}.\n\n"
-                    "Please check your email and reply with the 6-digit code you received."
+                    "🔄 Starting fresh verification process!\n\n"
+                    "Please provide your email address to begin verification.\n\n"
+                    "💡 Type 'restart' at any time to restart the process."
                 )
+            
+            # Try to extract email from the message
+            extracted_email = self._extract_email_from_text(message_text)
+            
+            if extracted_email:
+                # Create new user with the provided email
+                user_with_profile = await self.auth_user_service.create_authenticated_user(
+                    bluebubbles_guid=user_guid,
+                    phone_number=phone_number,
+                    email=extracted_email,
+                    chat_identifier=chat_identifier
+                )
+                
+                # Store email in user_profiles table
+                await self._store_email_in_profile(user_with_profile.profile.id, extracted_email)
+                
+                # Send OTP to the email using Supabase Auth
+                otp_result = await self._send_email_otp(extracted_email)
+                if otp_result["success"]:
+                    logger.info(f"Email OTP sent to {extracted_email} for new user {user_with_profile.profile.id}")
+                    return (
+                        f"📧 Perfect! I've sent a verification code to {extracted_email}.\n\n"
+                        "Please check your email and reply with the 6-digit code you received.\n\n"
+                        "💡 Type 'restart' at any time to restart the verification process with a new email."
+                    )
+                else:
+                    logger.error(f"Failed to send email OTP to {extracted_email} for new user")
+                    return "❌ Sorry, I couldn't send the verification email. Please try again later."
             else:
-                logger.error(f"Failed to send email OTP to {email}: {otp_result.get('error')}")
-                return "Sorry, I couldn't send the verification code. Please try again with a different email address."
+                # No email found - prompt for email
+                # Create user with temporary email first
+                temp_email = f"temp_{phone_number.replace('+', '').replace('-', '')}@temp.example.com"
+                
+                user_with_profile = await self.auth_user_service.create_authenticated_user(
+                    bluebubbles_guid=user_guid,
+                    phone_number=phone_number,
+                    email=temp_email,
+                    chat_identifier=chat_identifier
+                )
+                
+                return (
+                    "👋 Welcome! To get started, I need to verify your email address.\n\n"
+                    "Please reply with your email address.\n\n"
+                    "💡 Type 'restart' at any time to restart the verification process."
+                )
                 
         except Exception as e:
-            logger.error(f"Error handling email provided: {str(e)}")
-            return "Sorry, there was an error processing your email. Please try again."
+            logger.error(f"Error in new user workflow: {str(e)}")
+            return "❌ Sorry, there was an error setting up your account. Please try again or type 'restart' to start over."
     
     async def _handle_otp_provided(self, phone_number: str, otp_code: str) -> str:
         """Handle when user provides OTP code"""
