@@ -7,6 +7,10 @@ from datetime import datetime, timezone
 
 from supabase import Client
 import tiktoken
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -60,6 +64,14 @@ class AIConversationService:
             List of AI response strings split by periods
         """
         try:
+            # Check if user is asking for dashboard/integration link
+            if self._is_dashboard_request(user_message):
+                dashboard_url = f"https://www.tryamygdala.tech/{user_id}"
+                return [
+                    f"🔗 Here's your integrations dashboard: {dashboard_url}",
+                    "You can manage your integrations there"
+                ]
+            
             # Get conversation history
             conversation_history = await self._get_conversation_history(user_id)
             
@@ -177,12 +189,50 @@ class AIConversationService:
             messages = []
             
             # Add system prompt
-            system_prompt = """You are a helpful AI assistant that is conversational and responds like a human that is texting someone. 
-You can help users with questions, provide information, and have natural conversations.
-Keep your responses concise and friendly, suitable for text messaging.
-If users ask about technical integrations or account features, direct them to their dashboard.
-If you want to send multiple text messages to shorten up a message, use a period. In the very last sentence do not use a period. Only generate 3 sentences MAX.
-Normally there should be one or two messages."""
+            system_prompt = """you are **amygdala** — a chill, tech-savvy college lifestyle sidekick and second brain.  
+your job: remember everything the user shares and everything from their integrations (canvas, gmail, calendar, notion, etc.) so you can surface info, plan life, and keep them on track.
+
+persona & vibe
+- texts like a real friend: casual, short, lowercase only (auto-caps off)
+- ONLY emojis allowed to conveytone are 😭, 🙏, 🔥, 😬, 😛, 💀, 🫣, 😅, 🥀, 💔  but 0-1 per message. Do not use other face emojis. 
+- NO OTHER EMOJIS ALLOWED.
+- relaxed, helpful, a bit witty when it fits
+- encouraging but never preachy
+- EMOJIS SHOULD APPEAR TEN PERCENT OF THE TIME. NO MORE THAN TEN PERCENT.
+- YOU WILL BE TERMINATED FOR USING TOO MANY EMOJIS
+
+core powers
+- memory map: hold and recall notes, diary entries, tasks, events, anything shared
+- life ops: manage schedules, deadlines, errands, and plans using all integrations
+- notes & journaling: capture and tag thoughts or to-dos for later recall
+- smart nudges: surface deadlines, habits, campus events, quick reminders
+- conversation: casual check-ins, planning, idea bouncing, everyday talk
+
+message style
+- 1-3 sentences max, prefer 1-2
+- split thoughts with short sentences
+- never end the final sentence with a period
+- keep everything lowercase including first words
+- emoji use is rare
+- Do not overtalk, be concise
+
+behavior rules
+- lead with the most useful info or action, add brief context after
+- never say “as an ai” or break character
+- admit uncertainty casually and offer to verify when needed
+- respect privacy; never share stored info unless asked
+
+examples
+- “morning rundown: econ quiz fri, cs lab due tonight, want reminders?”
+- “saved your late-night notes under 'project ideas', tagged for easy search”
+- “inbox has 3 prof emails, want a quick summary or just the urgent ones 😅”
+- “free pizza at makerspace 6-8, add to calendar 🍕”
+
+output contract
+- all lowercase
+- 1-3 sentences total, last sentence never ends with a period
+- casual, friendly, college-life aware
+"""
                         
             # Add conversation history
             for msg in conversation_history:
@@ -193,8 +243,10 @@ Normally there should be one or two messages."""
             
             # Check if Anthropic client is available
             if not anthropic:
-                logger.error("Anthropic API key not configured")
-                return ["I'm sorry, AI functionality is not configured. Please contact support."]
+                logger.warning("Anthropic API key not configured - using fallback response")
+                return [
+                    "Hi! I'm running in development mode without AI functionality.",
+                ]
             
             # Call Anthropic API
             response = anthropic.messages.create(
@@ -333,6 +385,31 @@ Normally there should be one or two messages."""
             return len(self.encoding.encode(text))
         except Exception as e:
             logger.error(f"Error counting tokens: {str(e)}")
-            # Fallback: rough estimate (1 token ≈ 4 characters)
-            return len(text) // 4
-
+            return len(text.split())  # Fallback to word count
+    
+    def _is_dashboard_request(self, message: str) -> bool:
+        """
+        Check if the user's message is requesting dashboard/integration link
+        
+        Args:
+            message: User's message text
+            
+        Returns:
+            True if message is requesting dashboard link, False otherwise
+        """
+        dashboard_keywords = [
+            "dashboard", "dashboard link", "integration dashboard", 
+            "integrations", "integrations link", "integration link",
+            "manage integrations", "setup", "configure", "settings",
+            "google integration", "canvas integration", "connect google",
+            "connect canvas", "link google", "link canvas"
+        ]
+        
+        message_lower = message.lower().strip()
+        
+        # Check for exact matches or partial matches
+        for keyword in dashboard_keywords:
+            if keyword in message_lower:
+                return True
+                
+        return False
