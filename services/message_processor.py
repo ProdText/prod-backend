@@ -290,6 +290,17 @@ class MessageProcessor:
     def _extract_email_from_text(self, text: str) -> Optional[str]:
         """Extract email address from natural language text using RegEx"""
         import re
+        
+        # Skip email extraction if this looks like an AI function call request
+        ai_function_keywords = [
+            "draft", "send", "email", "compose", "write", "create", "schedule", "calendar", "meeting"
+        ]
+        
+        text_lower = text.lower()
+        if any(keyword in text_lower for keyword in ai_function_keywords):
+            # This looks like an AI function call, don't extract emails for onboarding
+            return None
+        
         # Email regex pattern - matches most common email formats
         email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
         matches = re.findall(email_pattern, text)
