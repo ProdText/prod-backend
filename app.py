@@ -40,8 +40,13 @@ if not supabase_url or not supabase_service_role_key:
     raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
 
 def get_fresh_supabase_client() -> Client:
-    """Create a fresh Supabase client for each request to prevent session conflicts"""
-    return create_client(supabase_url, supabase_service_role_key)
+    """Create a completely fresh Supabase client for each request to prevent session conflicts"""
+    # Use ClientOptions to ensure complete isolation
+    options = ClientOptions(
+        auto_refresh_token=False,  # Disable automatic token refresh
+        persist_session=False      # Don't persist session state
+    )
+    return create_client(supabase_url, supabase_service_role_key, options)
 
 # Initialize BlueBubbles client (stateless)
 bluebubbles_client = get_bluebubbles_client()
@@ -132,13 +137,15 @@ async def receive_bluebubbles_webhook(
     # Log the incoming webhook
     logger.info(f"Received BlueBubbles webhook - Event ID: {event_id}, Type: {event_type}")
     
-    # Process the message with fresh Supabase client
+    # Process the message with completely fresh Supabase client per webhook
     try:
-        # Create fresh services for each request to prevent session conflicts
+        # Create completely isolated services for each webhook request
+        logger.info(f"Creating fresh Supabase client for webhook {event_id}")
         fresh_supabase_client = get_fresh_supabase_client()
         auth_user_service = AuthUserService(fresh_supabase_client)
         message_processor = MessageProcessor(auth_user_service, bluebubbles_client)
         
+        logger.info(f"Processing webhook {event_id} with isolated client")
         result = await message_processor.process_webhook_message(webhook_payload)
         
         logger.info(f"Processed webhook {event_id}: {result.message}")

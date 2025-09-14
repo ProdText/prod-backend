@@ -58,15 +58,16 @@ async def send_message(session, phone: str, message: str, user_id: str):
         return False, str(e)
 
 async def test_complete_workflow():
-    """Test the complete user onboarding workflow"""
+    """Test the complete user onboarding workflow with concurrent users"""
     
-    print("=== Testing Complete OTP Workflow ===\n")
+    print("=== Testing Complete Concurrent User Workflow ===\n")
     
-    # Test different phone numbers to simulate real users
+    # Test different phone numbers to simulate real concurrent users
+    import time
+    timestamp = int(time.time())
     test_scenarios = [
-        ("+15551234567", "newuser1@example.com"),
-        ("+15551234568", "newuser2@example.com"), 
-        ("+15551234569", "newuser3@example.com")
+        (f"+1555123456{i}", f"concurrent{i}-{timestamp}@example.com")
+        for i in range(5)
     ]
     
     async with aiohttp.ClientSession() as session:
