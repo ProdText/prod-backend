@@ -1,16 +1,17 @@
-import logging
-from typing import Optional, Dict, Any
 from enum import Enum
-from models.auth_user import AuthUserWithProfile, UserProfile
-from services.auth_user_service import AuthUserService
+from typing import Dict, Any, Optional
+import logging
+from supabase import Client
+from .auth_user_service import AuthUserService, AuthUserWithProfile
+from models.user import UserProfile
 
 logger = logging.getLogger(__name__)
 
 
 class OnboardingState(Enum):
-    """Onboarding states for user flow"""
     NOT_STARTED = "not_started"
-    AWAITING_OTP = "awaiting_otp"
+    AWAITING_EMAIL = "awaiting_email"
+    AWAITING_EMAIL_OTP = "awaiting_email_otp"
     COMPLETED = "completed"
 
 
@@ -22,53 +23,34 @@ class OnboardingService:
     
     async def start_onboarding(
         self, 
-        user_with_profile: AuthUserWithProfile,
-        original_phone: str
+        user_with_profile: AuthUserWithProfile
     ) -> Dict[str, Any]:
         """
-        Start the onboarding process by sending OTP to user's phone
+        Start the onboarding process by asking for user's email
         
         Args:
             user_with_profile: User with profile data
-            original_phone: The user's actual phone number for OTP
             
         Returns:
             Dict with onboarding status and next steps
         """
         try:
-            # Update user profile to awaiting OTP state
+            # Update user onboarding state to awaiting email
             await self._update_onboarding_state(
                 user_with_profile.profile.id, 
-                OnboardingState.AWAITING_OTP,
-                {"original_phone": original_phone}
+                OnboardingState.AWAITING_EMAIL
             )
             
-            # Send OTP via Supabase Auth
-            otp_result = await self._send_otp(original_phone)
-            
-            if otp_result["success"]:
-                logger.info(f"OTP sent to {original_phone} for user {user_with_profile.profile.id}")
-                return {
-                    "success": True,
-                    "state": OnboardingState.AWAITING_OTP.value,
-                    "message": "OTP sent successfully",
-                    "response_text": (
-                        "👋 Welcome! To get started, I need to verify your phone number.\n\n"
-                        f"I've sent a verification code to {original_phone}. "
-                        "Please reply with the 6-digit code you received."
-                    )
-                }
-            else:
-                logger.error(f"Failed to send OTP to {original_phone}: {otp_result.get('error')}")
-                return {
-                    "success": False,
-                    "state": OnboardingState.NOT_STARTED.value,
-                    "message": "Failed to send OTP",
-                    "response_text": (
-                        "Sorry, I couldn't send a verification code to your phone. "
-                        "Please try again later or contact support."
-                    )
-                }
+            logger.info(f"Started onboarding for user {user_with_profile.profile.id}")
+            return {
+                "success": True,
+                "state": OnboardingState.AWAITING_EMAIL.value,
+                "message": "Onboarding started - awaiting email",
+                "response_text": (
+                    "👋 Welcome! To get started, I need to verify your email address.\n\n"
+                    "Please reply with your email address and I'll send you a verification code."
+                )
+            }
                 
         except Exception as e:
             logger.error(f"Error starting onboarding: {str(e)}")
@@ -79,11 +61,69 @@ class OnboardingService:
                 "response_text": "Sorry, there was an error starting the verification process. Please try again."
             }
     
+    async def send_email_otp(
+        self, 
+        user_with_profile: AuthUserWithProfile,
+        user_email: str
+    ) -> Dict[str, Any]:
+        """
+        Send email OTP to user's email address and update user with real email
+        
+        Args:
+            user_with_profile: User with profile data
+            user_email: The user's email address for OTP
+            
+        Returns:
+            Dict with OTP send status and response
+        """
+        try:
+            # First, update the auth user with the real email address
+            await self._update_user_email(user_with_profile.auth_user.id, user_email)
+            
+            # Update user onboarding state with email
+            await self._update_onboarding_state(
+                user_with_profile.profile.id, 
+                OnboardingState.AWAITING_EMAIL_OTP,
+                {"email": user_email}
+            )
+            
+            # Send OTP via Supabase Auth
+            otp_result = await self._send_email_otp(user_email)
+            
+            if otp_result["success"]:
+                logger.info(f"Email OTP sent to {user_email} for user {user_with_profile.profile.id}")
+                return {
+                    "success": True,
+                    "state": OnboardingState.AWAITING_EMAIL_OTP.value,
+                    "message": "Email OTP sent successfully",
+                    "response_text": (
+                        f"📧 Perfect! I've sent a verification code to {user_email}.\n\n"
+                        "Please check your email and reply with the 6-digit code you received."
+                    )
+                }
+            else:
+                logger.error(f"Failed to send email OTP to {user_email}: {otp_result.get('error')}")
+                return {
+                    "success": False,
+                    "state": OnboardingState.AWAITING_EMAIL.value,
+                    "message": f"Email OTP send error: {otp_result.get('error')}",
+                    "response_text": "Sorry, there was an error sending the verification code. Please check your email address and try again."
+                }
+                
+        except Exception as e:
+            logger.error(f"Error sending email OTP: {str(e)}")
+            return {
+                "success": False,
+                "state": OnboardingState.AWAITING_EMAIL.value,
+                "message": f"Email OTP error: {str(e)}",
+                "response_text": "Sorry, there was an error sending the verification code. Please try again."
+            }
+    
     async def verify_otp(
         self, 
         user_with_profile: AuthUserWithProfile,
         otp_code: str,
-        original_phone: str
+        user_email: str
     ) -> Dict[str, Any]:
         """
         Verify the OTP code provided by user
@@ -91,93 +131,86 @@ class OnboardingService:
         Args:
             user_with_profile: User with profile data
             otp_code: The OTP code provided by user
-            original_phone: The user's actual phone number
+            user_email: The user's email address
             
         Returns:
             Dict with verification status and response
         """
         try:
             # Verify OTP with Supabase Auth
-            verification_result = await self._verify_otp_code(original_phone, otp_code)
+            verification_result = await self._verify_otp_code(user_email, otp_code)
             
             if verification_result["success"]:
                 # Complete onboarding
-                await self._update_onboarding_state(
-                    user_with_profile.profile.id,
-                    OnboardingState.COMPLETED,
-                    {"phone_verified": True, "verified_at": "now()"}
-                )
+                await self._complete_onboarding(user_with_profile.profile.id)
                 
-                # Mark onboarding as completed in auth service
-                await self.auth_user_service.complete_onboarding(user_with_profile.profile.id)
-                
-                logger.info(f"OTP verification successful for user {user_with_profile.profile.id}")
+                logger.info(f"Email OTP verified for user {user_with_profile.profile.id}")
                 return {
                     "success": True,
                     "state": OnboardingState.COMPLETED.value,
-                    "message": "OTP verification successful",
+                    "message": "Email OTP verified successfully",
                     "response_text": (
-                        "✅ Phone verification successful! Welcome aboard!\n\n"
-                        "You're all set up and ready to go. I'm your AI assistant and I can help you with "
-                        "questions, tasks, and more. What would you like to know?"
+                        "🎉 Perfect! Your email has been verified.\n\n"
+                        "You're all set up! I can now help you with your messages and queries. "
+                        "What would you like to know?"
                     )
                 }
             else:
-                logger.warning(f"OTP verification failed for user {user_with_profile.profile.id}")
+                logger.error(f"Email OTP verification failed for user {user_with_profile.profile.id}")
                 return {
                     "success": False,
-                    "state": OnboardingState.AWAITING_OTP.value,
-                    "message": "Invalid OTP code",
+                    "state": OnboardingState.AWAITING_EMAIL_OTP.value,
+                    "message": "Email OTP verification failed",
                     "response_text": (
-                        "❌ The verification code you entered is incorrect or expired.\n\n"
-                        "Please check the code and try again, or reply 'RESEND' to get a new code."
+                        "❌ That code doesn't look right. Please check your email and try again.\n\n"
+                        "Reply 'RESEND' if you need a new code."
                     )
                 }
                 
         except Exception as e:
-            logger.error(f"Error verifying OTP: {str(e)}")
+            logger.error(f"Error verifying email OTP: {str(e)}")
             return {
                 "success": False,
-                "state": OnboardingState.AWAITING_OTP.value,
-                "message": f"OTP verification error: {str(e)}",
+                "state": OnboardingState.AWAITING_EMAIL_OTP.value,
+                "message": f"Email OTP verification error: {str(e)}",
                 "response_text": "Sorry, there was an error verifying your code. Please try again."
             }
     
     async def resend_otp(
         self, 
         user_with_profile: AuthUserWithProfile,
-        original_phone: str
+        user_email: str
     ) -> Dict[str, Any]:
         """
-        Resend OTP to user's phone
+        Resend OTP to user's email
         
         Args:
             user_with_profile: User with profile data
-            original_phone: The user's actual phone number
+            user_email: The user's email address
             
         Returns:
             Dict with resend status and response
         """
         try:
             # Send new OTP
-            otp_result = await self._send_otp(original_phone)
+            otp_result = await self._send_email_otp(user_email)
             
             if otp_result["success"]:
-                logger.info(f"OTP resent to {original_phone} for user {user_with_profile.profile.id}")
+                logger.info(f"Email OTP resent to {user_email} for user {user_with_profile.profile.id}")
                 return {
                     "success": True,
-                    "state": OnboardingState.AWAITING_OTP.value,
-                    "message": "OTP resent successfully",
+                    "state": OnboardingState.AWAITING_EMAIL_OTP.value,
+                    "message": "Email OTP resent successfully",
                     "response_text": (
-                        f"📱 I've sent a new verification code to {original_phone}.\n\n"
+                        f"📧 I've sent a new verification code to {user_email}.\n\n"
                         "Please reply with the 6-digit code you received."
                     )
                 }
             else:
-                logger.error(f"Failed to resend OTP to {original_phone}")
+                logger.error(f"Failed to resend email OTP to {user_email}")
                 return {
                     "success": False,
-                    "state": OnboardingState.AWAITING_OTP.value,
+                    "state": OnboardingState.AWAITING_EMAIL_OTP.value,
                     "message": "Failed to resend OTP",
                     "response_text": "Sorry, I couldn't send a new verification code. Please try again later."
                 }
@@ -186,7 +219,7 @@ class OnboardingService:
             logger.error(f"Error resending OTP: {str(e)}")
             return {
                 "success": False,
-                "state": OnboardingState.AWAITING_OTP.value,
+                "state": OnboardingState.AWAITING_EMAIL_OTP.value,
                 "message": f"OTP resend error: {str(e)}",
                 "response_text": "Sorry, there was an error sending a new code. Please try again."
             }
@@ -214,40 +247,40 @@ class OnboardingService:
         
         return OnboardingState.NOT_STARTED
     
-    async def _send_otp(self, phone_number: str) -> Dict[str, Any]:
+    async def _send_email_otp(self, email: str) -> Dict[str, Any]:
         """
-        Send OTP via Supabase Auth API
+        Send OTP via Supabase Auth API to email
         
         Args:
-            phone_number: Phone number to send OTP to
+            email: Email address to send OTP to
             
         Returns:
             Dict with success status and any error info
         """
         try:
-            # Use Supabase Auth API to send OTP
+            # Use Supabase Auth API to send email OTP
             response = self.auth_user_service.supabase.auth.sign_in_with_otp({
-                "phone": phone_number
+                "email": email
             })
             
             return {
                 "success": True,
-                "message": "OTP sent successfully"
+                "message": "Email OTP sent successfully"
             }
             
         except Exception as e:
-            logger.error(f"Error sending OTP to {phone_number}: {str(e)}")
+            logger.error(f"Error sending email OTP to {email}: {str(e)}")
             return {
                 "success": False,
                 "error": str(e)
             }
     
-    async def _verify_otp_code(self, phone_number: str, otp_code: str) -> Dict[str, Any]:
+    async def _verify_otp_code(self, email: str, otp_code: str) -> Dict[str, Any]:
         """
         Verify OTP code with Supabase Auth
         
         Args:
-            phone_number: Phone number that received the OTP
+            email: Email address that received the OTP
             otp_code: The OTP code to verify
             
         Returns:
@@ -256,9 +289,9 @@ class OnboardingService:
         try:
             # Use Supabase Auth API to verify OTP
             response = self.auth_user_service.supabase.auth.verify_otp({
-                "phone": phone_number,
+                "email": email,
                 "token": otp_code,
-                "type": "sms"
+                "type": "email"
             })
             
             if response.user:
@@ -273,7 +306,7 @@ class OnboardingService:
                 }
                 
         except Exception as e:
-            logger.error(f"Error verifying OTP for {phone_number}: {str(e)}")
+            logger.error(f"Error verifying OTP for {email}: {str(e)}")
             return {
                 "success": False,
                 "error": str(e)
@@ -314,4 +347,41 @@ class OnboardingService:
             
         except Exception as e:
             logger.error(f"Error updating onboarding state: {str(e)}")
+            raise
+    
+    async def _update_user_email(self, user_id: str, email: str) -> None:
+        """
+        Update the auth user's email address
+        
+        Args:
+            user_id: Auth user ID
+            email: New email address
+        """
+        try:
+            # Update the auth user's email using admin API
+            self.auth_user_service.admin_auth.update_user_by_id(user_id, {
+                "email": email
+            })
+            logger.info(f"Updated user {user_id} email to {email}")
+        except Exception as e:
+            logger.error(f"Error updating user email: {str(e)}")
+            raise
+    
+    async def _complete_onboarding(self, user_id: str) -> None:
+        """Mark onboarding as completed for user"""
+        try:
+            update_data = {
+                "onboarding_completed": True,
+                "onboarding_state": OnboardingState.COMPLETED.value,
+                "email_verified": True,
+                "verified_at": "now()"
+            }
+            
+            result = self.auth_user_service.supabase.table("user_profiles").update(update_data).eq("id", user_id).execute()
+            
+            if not result.data:
+                raise Exception("Failed to update onboarding completion")
+                
+        except Exception as e:
+            logger.error(f"Error completing onboarding: {str(e)}")
             raise

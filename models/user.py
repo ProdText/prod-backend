@@ -30,3 +30,20 @@ class UserUpdate(BaseModel):
     phone_number: Optional[str] = None
     chat_identifier: Optional[str] = None
     interaction_count: Optional[int] = None
+
+
+class UserProfile(BaseModel):
+    """User profile model matching Supabase user_profiles table"""
+    id: str
+    bluebubbles_guid: str
+    phone_number: str
+    email: Optional[str] = None
+    chat_identifier: Optional[str] = None
+    onboarding_completed: bool = False
+    onboarding_state: str = "not_started"
+    email_verified: bool = False
+    verified_at: Optional[datetime] = None
+    interaction_count: int = 0
+    last_interaction_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None

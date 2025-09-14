@@ -29,13 +29,13 @@ CREATE TABLE public.bb_events (
 -- Step 5: Recreate user_profiles table with onboarding support
 CREATE TABLE public.user_profiles (
     id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-    bluebubbles_guid TEXT UNIQUE NOT NULL,
-    phone_number TEXT,
-    original_phone TEXT,
+    bluebubbles_guid TEXT NOT NULL UNIQUE,
+    phone_number TEXT NOT NULL,
+    email TEXT,
     chat_identifier TEXT,
     onboarding_completed BOOLEAN DEFAULT FALSE,
     onboarding_state TEXT DEFAULT 'not_started',
-    phone_verified BOOLEAN DEFAULT FALSE,
+    email_verified BOOLEAN DEFAULT FALSE,
     verified_at TIMESTAMPTZ,
     interaction_count INTEGER DEFAULT 0,
     last_interaction_at TIMESTAMPTZ DEFAULT NOW(),
@@ -99,11 +99,11 @@ BEGIN
             phone_number,
             onboarding_completed,
             onboarding_state,
-            phone_verified
+            email_verified
         ) VALUES (
             NEW.id,
             NEW.raw_user_meta_data->>'bluebubbles_guid',
-            NEW.raw_user_meta_data->>'original_phone',
+            NEW.raw_user_meta_data->>'phone_number',
             false,
             'not_started',
             false
@@ -122,9 +122,9 @@ CREATE TRIGGER on_auth_user_created
 -- Step 14: Add helpful comments
 COMMENT ON TABLE public.bb_events IS 'BlueBubbles webhook events storage';
 COMMENT ON TABLE public.user_profiles IS 'User profiles linked to auth.users with BlueBubbles-specific data';
-COMMENT ON COLUMN public.user_profiles.onboarding_state IS 'Current onboarding state: not_started, awaiting_otp, completed';
-COMMENT ON COLUMN public.user_profiles.phone_verified IS 'Whether the users phone number has been verified via OTP';
-COMMENT ON COLUMN public.user_profiles.verified_at IS 'Timestamp when phone verification was completed';
+COMMENT ON COLUMN public.user_profiles.onboarding_state IS 'Current onboarding state: not_started, awaiting_email, awaiting_email_otp, completed';
+COMMENT ON COLUMN public.user_profiles.email_verified IS 'Whether the users email has been verified via OTP';
+COMMENT ON COLUMN public.user_profiles.verified_at IS 'Timestamp when email verification was completed';
 
 -- =====================================================
 -- RESET COMPLETE

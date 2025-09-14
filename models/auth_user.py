@@ -1,6 +1,9 @@
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 from datetime import datetime
+
+if TYPE_CHECKING:
+    from models.user import UserProfile as UserProfileModel
 
 
 class AuthUser(BaseModel):
@@ -50,4 +53,5 @@ class UserProfileUpdate(BaseModel):
 class AuthUserWithProfile(BaseModel):
     """Combined auth user with profile data"""
     auth_user: AuthUser
-    profile: UserProfile
+    user: AuthUser  # For backward compatibility
+    profile: 'UserProfileModel'  # Forward reference to avoid circular imports

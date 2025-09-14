@@ -22,7 +22,7 @@ class BlueBubblesChat(BaseModel):
 
 class BlueBubblesMessage(BaseModel):
     """BlueBubbles message data structure"""
-    guid: str
+    guid: Optional[str] = None  # Make optional for read receipts
     text: Optional[str] = None
     handle: Optional[BlueBubblesHandle] = None
     hasAttachments: Optional[bool] = False
@@ -35,6 +35,9 @@ class BlueBubblesMessage(BaseModel):
     isSystemMessage: Optional[bool] = False
     isServiceMessage: Optional[bool] = False
     chats: Optional[List[BlueBubblesChat]] = []
+    # Additional fields for read receipts and other events
+    chatGuid: Optional[str] = None
+    read: Optional[bool] = None
 
 
 class WebhookPayload(BaseModel):

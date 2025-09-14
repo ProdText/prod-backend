@@ -3,7 +3,15 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from supabase import Client
 from supabase.lib.client_options import ClientOptions
-from models.auth_user import AuthUser, UserProfile, UserProfileCreate, UserProfileUpdate, AuthUserWithProfile
+from models.auth_user import AuthUser, UserProfileCreate, UserProfileUpdate
+from models.user import UserProfile
+
+class AuthUserWithProfile:
+    """Combined auth user with profile data"""
+    def __init__(self, auth_user, profile):
+        self.auth_user = auth_user
+        self.user = auth_user  # For backward compatibility
+        self.profile = profile
 
 logger = logging.getLogger(__name__)
 
@@ -64,33 +72,25 @@ class AuthUserService:
     async def create_authenticated_user(
         self, 
         bluebubbles_guid: str, 
-        phone_number: Optional[str] = None, 
+        phone_number: str,
+        email: str,
         chat_identifier: Optional[str] = None
     ) -> AuthUserWithProfile:
-        """Create a new authenticated user with profile using phone authentication"""
+        """Create a new authenticated user with profile using real email address"""
         try:
             if not phone_number:
                 raise Exception("Phone number is required for user creation")
             
-            # Normalize the original phone to E.164 format if possible
-            normalized_phone = self._normalize_phone_number(phone_number)
+            if not email:
+                raise Exception("Email is required for user creation")
             
-            # Since Supabase requires unique phone numbers but BlueBubbles may have multiple
-            # message GUIDs from the same phone, we'll use a GUID-based phone format
-            # Format: +1555XXXXXXXX where XXXXXXXX is numeric from GUID hash
-            import hashlib
-            guid_hash = hashlib.md5(bluebubbles_guid.encode()).hexdigest()[:8]
-            # Convert hex to numeric
-            numeric_suffix = str(int(guid_hash, 16))[:8].zfill(8)
-            unique_phone = f"+1555{numeric_suffix}"
-            
-            # Create auth user with GUID-based phone
+            # Create auth user with real email address
             auth_response = self.admin_auth.create_user({
-                "phone": unique_phone,
-                "phone_confirm": True,  # Auto-confirm since this is server-side
+                "email": email,
+                "email_confirm": False,  # User must verify via OTP
                 "user_metadata": {
                     "bluebubbles_guid": bluebubbles_guid,
-                    "original_phone": phone_number,  # Store original phone
+                    "phone_number": phone_number,  # Store phone number
                     "source": "bluebubbles_webhook"
                 }
             })
@@ -110,7 +110,7 @@ class AuthUserService:
                     "interaction_count": 1,
                     "onboarding_completed": False,
                     "onboarding_state": "not_started",
-                    "phone_verified": False
+                    "email_verified": False
                 }).execute()
             except Exception as profile_error:
                 # If profile creation fails due to existing record, try to get it
@@ -250,6 +250,62 @@ class AuthUserService:
             logger.error(f"Error getting user profile by GUID {bluebubbles_guid}: {str(e)}")
             return None
     
+    async def get_user_by_phone_number(self, phone_number: str) -> Optional[AuthUserWithProfile]:
+        """Get authenticated user with profile by phone number"""
+        try:
+            # Get user profile by phone number
+            profile_result = self.supabase.table("user_profiles").select("*").eq(
+                "phone_number", phone_number
+            ).execute()
+            
+            if not profile_result.data:
+                return None
+            
+            profile_data = profile_result.data[0]
+            user_profile = UserProfile(**profile_data)
+            
+            # Get auth user data
+            auth_user_result = self.admin_auth.get_user_by_id(profile_data["id"])
+            if not auth_user_result.user:
+                return None
+            
+            return AuthUserWithProfile(
+                auth_user=auth_user_result.user,
+                profile=user_profile
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting user by phone number {phone_number}: {str(e)}")
+            return None
+
+    async def get_user_by_guid(self, bluebubbles_guid: str) -> Optional[AuthUserWithProfile]:
+        """Get authenticated user with profile by BlueBubbles GUID"""
+        try:
+            # Get user profile first
+            profile_result = self.supabase.table("user_profiles").select("*").eq(
+                "bluebubbles_guid", bluebubbles_guid
+            ).execute()
+            
+            if not profile_result.data:
+                return None
+            
+            profile_data = profile_result.data[0]
+            user_profile = UserProfile(**profile_data)
+            
+            # Get auth user data
+            auth_user_result = self.admin_auth.get_user_by_id(profile_data["id"])
+            if not auth_user_result.user:
+                return None
+            
+            return AuthUserWithProfile(
+                auth_user=auth_user_result.user,
+                profile=user_profile
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting user by GUID {bluebubbles_guid}: {str(e)}")
+            return None
+
     async def update_user_profile(self, user_id: str, updates: UserProfileUpdate) -> UserProfile:
         """Update user profile"""
         try:
