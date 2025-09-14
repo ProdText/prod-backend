@@ -32,26 +32,24 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Initialize Supabase client
+# Store Supabase credentials for per-request client creation
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not supabase_url or not supabase_service_role_key:
     raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
 
-supabase_client = create_client(
-    supabase_url, 
-    supabase_service_role_key,
-    options=ClientOptions(
-        auto_refresh_token=False,
-        persist_session=False
+def get_fresh_supabase_client() -> Client:
+    """Create a completely fresh Supabase client for each request to prevent session conflicts"""
+    # Use ClientOptions to ensure complete isolation
+    options = ClientOptions(
+        auto_refresh_token=False,  # Disable automatic token refresh
+        persist_session=False      # Don't persist session state
     )
-)
+    return create_client(supabase_url, supabase_service_role_key, options)
 
-# Initialize services with auth integration
-auth_user_service = AuthUserService(supabase_client)
+# Initialize BlueBubbles client (stateless)
 bluebubbles_client = get_bluebubbles_client()
-message_processor = MessageProcessor(auth_user_service, bluebubbles_client)
 
 # Optional webhook shared secret for validation
 WEBHOOK_SHARED_SECRET = os.getenv("WEBHOOK_SHARED_SECRET")
@@ -139,8 +137,15 @@ async def receive_bluebubbles_webhook(
     # Log the incoming webhook
     logger.info(f"Received BlueBubbles webhook - Event ID: {event_id}, Type: {event_type}")
     
-    # Process the message
+    # Process the message with completely fresh Supabase client per webhook
     try:
+        # Create completely isolated services for each webhook request
+        logger.info(f"Creating fresh Supabase client for webhook {event_id}")
+        fresh_supabase_client = get_fresh_supabase_client()
+        auth_user_service = AuthUserService(fresh_supabase_client)
+        message_processor = MessageProcessor(auth_user_service, bluebubbles_client)
+        
+        logger.info(f"Processing webhook {event_id} with isolated client")
         result = await message_processor.process_webhook_message(webhook_payload)
         
         logger.info(f"Processed webhook {event_id}: {result.message}")

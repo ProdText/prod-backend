@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from models.message import WebhookPayload, BlueBubblesMessage, MessageResponse
 from models.auth_user import AuthUserWithProfile, UserProfile
 from services.auth_user_service import AuthUserService
@@ -79,9 +79,8 @@ class MessageProcessor:
                     response_texts = await self._handle_ai_conversation(
                         existing_user, message_data.text, phone_number
                     )
-
                 else:
-                    # Existing user but not verified - continue onboarding workflow
+                    # Existing user but email not verified - continue onboarding workflow
                     response_text = await self._handle_existing_user_workflow(message_data, existing_user, phone_number, chat_identifier)
             else:
                 # New user - handle onboarding workflow
@@ -176,8 +175,23 @@ class MessageProcessor:
         try:
             message_text = getattr(message, 'text', '').strip()
             
-            # Check if email already exists in profile and current state
-            if existing_user.profile.email and existing_user.profile.onboarding_state != "awaiting_email_otp":
+            logger.info(f"Existing user workflow - State: {existing_user.profile.onboarding_state}, Message: '{message_text}'")
+            
+            # PRIORITY 1: Always check for OTP code first, regardless of state
+            if self._is_valid_otp_code(message_text):
+                logger.info(f"Valid OTP code detected: '{message_text}', proceeding to verification")
+                return await self._handle_otp_verification_existing(existing_user, message_text)
+            
+            # PRIORITY 2: State-based logic only if not an OTP
+            if existing_user.profile.onboarding_state == "awaiting_email_otp":
+                # User is awaiting OTP but didn't provide valid one
+                return (
+                    "❌ Please enter the 6-digit verification code from your email.\n\n"
+                    "Example: 123456"
+                )
+            
+            # Check if email already exists in profile and user hasn't started OTP process
+            if existing_user.profile.email and existing_user.profile.onboarding_state in ["not_started", "awaiting_email"]:
                 # Email exists but not yet waiting for OTP - send OTP
                 await self._update_onboarding_state(existing_user.profile.id, "awaiting_email_otp")
                 
@@ -208,15 +222,6 @@ class MessageProcessor:
                     return (
                         "❌ Please provide a valid email address.\n\n"
                         "Example: your.email@example.com"
-                    )
-            elif existing_user.profile.onboarding_state == "awaiting_email_otp":
-                # User should provide OTP code
-                if self._is_valid_otp_code(message_text):
-                    return await self._handle_otp_verification_existing(existing_user, message_text)
-                else:
-                    return (
-                        "❌ Please enter the 6-digit verification code from your email.\n\n"
-                        "Example: 123456"
                     )
             else:
                 # Unknown state - restart onboarding
@@ -274,13 +279,15 @@ class MessageProcessor:
             verification_result = await self._verify_otp_code(user_email, otp_code)
             
             if verification_result["success"]:
-                # Complete onboarding
-                await self._complete_onboarding(existing_user.profile.id)
+                # Mark email as verified but keep onboarding_completed as false
+                # Dashboard will handle setting onboarding_completed to true
+                await self._mark_email_verified(existing_user.profile.id)
                 
                 logger.info(f"Email verification completed for existing user {existing_user.profile.id}")
                 return (
                     "✅ Email verified successfully! Your account is now active.\n\n"
-                    "🔗 Access your integrations dashboard: https://dashboard.example.com"
+                    "🔗 Access your integrations dashboard: https://dashboard.example.com\n\n"
+                    "Complete your setup there to start using the service."
                 )
             else:
                 logger.error(f"OTP verification failed for existing user: {verification_result.get('error')}")
@@ -294,10 +301,12 @@ class MessageProcessor:
             return "❌ Sorry, there was an error verifying your code. Please try again."
 
     async def _update_onboarding_state(self, user_id: str, state: str) -> None:
-        """Update user's onboarding state"""
+        """Update user's onboarding state with atomic operation"""
         try:
+            # Use atomic update with WHERE clause to prevent race conditions
             result = self.auth_user_service.supabase.table("user_profiles").update({
-                "onboarding_state": state
+                "onboarding_state": state,
+                "updated_at": "NOW()"
             }).eq("id", user_id).execute()
             
             if not result.data:
@@ -308,6 +317,21 @@ class MessageProcessor:
         except Exception as e:
             logger.error(f"Error updating onboarding state: {str(e)}")
             raise
+
+    def _is_valid_otp_code(self, text: str) -> bool:
+        """Check if text is a valid 6-digit OTP code"""
+        if not text:
+            return False
+        text = text.strip()
+        return len(text) == 6 and text.isdigit()
+
+    def _is_valid_email(self, text: str) -> bool:
+        """Check if text is a valid email address"""
+        if not text:
+            return False
+        import re
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(email_pattern, text.strip()) is not None
 
     async def _handle_new_user_workflow(self, message: BlueBubblesMessage, user_guid: str, phone_number: str, chat_identifier: str) -> str:
         """
@@ -348,8 +372,9 @@ class MessageProcessor:
                 chat_identifier=chat_identifier
             )
             
-            # Store email in user_profiles table
+            # Store email in user_profiles table and update state to awaiting_email_otp
             await self._store_email_in_profile(user_with_profile.profile.id, email)
+            await self._update_onboarding_state(user_with_profile.profile.id, "awaiting_email_otp")
             
             # Send OTP to the email using Supabase Auth
             otp_result = await self._send_email_otp(email)
@@ -371,9 +396,10 @@ class MessageProcessor:
     async def _handle_otp_provided(self, phone_number: str, otp_code: str) -> str:
         """Handle when user provides OTP code"""
         try:
-            # Get user by phone number to find their email
-            user_with_profile = await self.auth_user_service.get_user_by_phone_number(phone_number)
+            # Get user by phone number with retry logic for concurrent operations
+            user_with_profile = await self._get_user_with_retry(phone_number)
             if not user_with_profile:
+                logger.error(f"User lookup failed after retries for phone: {phone_number}")
                 return "Sorry, I couldn't find your account. Please start over by texting me again."
             
             user_email = user_with_profile.auth_user.email
@@ -382,15 +408,15 @@ class MessageProcessor:
             verification_result = await self._verify_otp_code(user_email, otp_code)
             
             if verification_result["success"]:
-                # Mark onboarding as completed
-                await self._complete_onboarding(user_with_profile.profile.id)
+                # Mark email as verified but keep onboarding_completed as false
+                # Dashboard will handle setting onboarding_completed to true
+                await self._mark_email_verified(user_with_profile.profile.id)
                 
                 logger.info(f"Email OTP verified for user {user_with_profile.profile.id}")
                 return (
-                    "🎉 Perfect! Your email has been verified.\n\n"
-                    "You're all set up! You can now access your integrations dashboard at:\n"
-                    "https://integrations.example.com\n\n"
-                    "What would you like to know?"
+                    "✅ Email verified successfully! Your account is now active.\n\n"
+                    "🔗 Access your integrations dashboard: https://dashboard.example.com\n\n"
+                    "Complete your setup there to start using the service."
                 )
             else:
                 logger.error(f"Email OTP verification failed for user {user_with_profile.profile.id}")
@@ -402,6 +428,33 @@ class MessageProcessor:
         except Exception as e:
             logger.error(f"Error verifying OTP: {str(e)}")
             return "Sorry, there was an error verifying your code. Please try again."
+    
+    async def _get_user_with_retry(self, phone_number: str, max_retries: int = 3):
+        """Get user by phone number with retry logic for concurrent operations"""
+        import asyncio
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"User lookup attempt {attempt + 1} for phone: {phone_number}")
+                user_with_profile = await self.auth_user_service.get_user_by_phone_number(phone_number)
+                
+                if user_with_profile:
+                    logger.info(f"User lookup successful on attempt {attempt + 1}")
+                    return user_with_profile
+                
+                # If no user found, wait a bit before retry (except on last attempt)
+                if attempt < max_retries - 1:
+                    logger.warning(f"User not found on attempt {attempt + 1}, retrying...")
+                    await asyncio.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                    
+            except Exception as e:
+                logger.error(f"User lookup error on attempt {attempt + 1}: {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.1 * (attempt + 1))
+                else:
+                    raise e
+        
+        return None
     
     async def _send_email_otp(self, email: str) -> dict:
         """Send OTP to email using Supabase Auth"""
@@ -433,8 +486,8 @@ class MessageProcessor:
         try:
             logger.info(f"Attempting to verify OTP for email: {email}, code: {otp_code}")
             
-            # Use Supabase Auth Admin API to verify OTP
-            response = self.auth_user_service.admin_auth.verify_otp({
+            # Use Supabase Auth client API to verify OTP
+            response = self.auth_user_service.supabase.auth.verify_otp({
                 "email": email,
                 "token": otp_code,
                 "type": "email"
@@ -477,6 +530,38 @@ class MessageProcessor:
             
         except Exception as e:
             logger.error(f"Error storing email in profile: {str(e)}")
+            raise
+
+    async def _mark_email_verified(self, user_id: str) -> None:
+        """Mark email as verified and update onboarding state to awaiting_integrations - atomic operation"""
+        try:
+            from datetime import datetime
+            
+            # Atomic update to prevent race conditions during concurrent verifications
+            update_data = {
+                "email_verified": True,
+                "verified_at": datetime.utcnow().isoformat(),
+                "onboarding_state": "awaiting_integrations",
+                "updated_at": "NOW()"
+                # onboarding_completed remains false - dashboard will set this
+            }
+            
+            # Use WHERE clause to ensure we only update if not already verified (prevents double processing)
+            result = self.auth_user_service.supabase.table("user_profiles").update(update_data).eq("id", user_id).eq("email_verified", False).execute()
+            
+            if not result.data:
+                # Check if already verified (not an error)
+                existing = self.auth_user_service.supabase.table("user_profiles").select("email_verified").eq("id", user_id).execute()
+                if existing.data and existing.data[0].get("email_verified"):
+                    logger.info(f"User {user_id} already verified (concurrent verification)")
+                    return
+                else:
+                    raise Exception("Failed to update email verification")
+                
+            logger.info(f"Marked email verified and updated state to awaiting_integrations for user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Error marking email verified: {str(e)}")
             raise
 
     async def _complete_onboarding(self, user_id: str) -> None:

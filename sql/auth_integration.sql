@@ -8,9 +8,13 @@ DROP TABLE IF EXISTS public.users;
 CREATE TABLE IF NOT EXISTS public.user_profiles (
     id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
     bluebubbles_guid TEXT UNIQUE NOT NULL,  -- BlueBubbles message/chat GUID
-    phone_number TEXT,                      -- Phone number from BlueBubbles handle
+    phone_number TEXT UNIQUE,               -- Phone number from BlueBubbles handle (UNIQUE for concurrency)
+    email TEXT UNIQUE,                      -- Email address (UNIQUE for concurrency)
     chat_identifier TEXT,                   -- BlueBubbles chat identifier for responses
     onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE,
+    onboarding_state TEXT NOT NULL DEFAULT 'not_started',
+    email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    verified_at TIMESTAMPTZ,
     first_interaction_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_interaction_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     interaction_count INTEGER NOT NULL DEFAULT 1,
@@ -48,11 +52,14 @@ CREATE POLICY "deny_public_access_profiles" ON public.user_profiles
     USING (FALSE)
     WITH CHECK (FALSE);
 
--- Create indexes for performance
+-- Create indexes for performance and concurrency
 CREATE INDEX IF NOT EXISTS idx_user_profiles_bluebubbles_guid ON public.user_profiles (bluebubbles_guid);
 CREATE INDEX IF NOT EXISTS idx_user_profiles_phone_number ON public.user_profiles (phone_number);
+CREATE INDEX IF NOT EXISTS idx_user_profiles_email ON public.user_profiles (email);
 CREATE INDEX IF NOT EXISTS idx_user_profiles_last_interaction ON public.user_profiles (last_interaction_at DESC);
 CREATE INDEX IF NOT EXISTS idx_user_profiles_onboarding ON public.user_profiles (onboarding_completed);
+CREATE INDEX IF NOT EXISTS idx_user_profiles_onboarding_state ON public.user_profiles (onboarding_state);
+CREATE INDEX IF NOT EXISTS idx_user_profiles_email_verified ON public.user_profiles (email_verified);
 
 -- Create function to update the updated_at timestamp
 CREATE OR REPLACE FUNCTION update_user_profiles_updated_at()
