@@ -98,9 +98,10 @@ class MessageProcessor:
                         )
                     else:
                         # Still need integrations - prompt for dashboard
+                        dashboard_url = f"https://www.tryamygdala.tech/{existing_user.profile.id}"
                         response_text = (
                             "🔗 Complete your setup to start using the service:\n"
-                            "https://dashboard.example.com\n\n"
+                            f"{dashboard_url}\n\n"
                             "Once you've set up your integrations, you'll be able to chat with me!"
                         )
                 else:
@@ -385,9 +386,10 @@ class MessageProcessor:
                 await self._mark_email_verified(existing_user.profile.id)
                 
                 logger.info(f"Email verification completed for existing user {existing_user.profile.id}")
+                dashboard_url = f"https://www.tryamygdala.tech/{existing_user.profile.id}"
                 return (
                     "✅ Email verified successfully! Your account is now active.\n\n"
-                    "🔗 Access your integrations dashboard: https://dashboard.example.com\n\n"
+                    f"🔗 Access your integrations dashboard: {dashboard_url}\n\n"
                     "Complete your setup there to start using the service."
                 )
             else:
@@ -518,9 +520,10 @@ class MessageProcessor:
                 await self._mark_email_verified(user_with_profile.profile.id)
                 
                 logger.info(f"Email OTP verified for user {user_with_profile.profile.id}")
+                dashboard_url = f"https://www.tryamygdala.tech/{user_with_profile.profile.id}"
                 return (
                     "✅ Email verified successfully! Your account is now active.\n\n"
-                    "🔗 Access your integrations dashboard: https://dashboard.example.com\n\n"
+                    f"🔗 Access your integrations dashboard: {dashboard_url}\n\n"
                     "Complete your setup there to start using the service."
                 )
             else:

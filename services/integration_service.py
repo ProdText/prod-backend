@@ -46,14 +46,14 @@ class IntegrationService:
                 logger.info(f"User {user_id} email not verified yet")
                 return False
             
-            # Check if both Google and Canvas integrations are complete
+            # Check if at least one integration (Google or Canvas) is complete
             google_complete = profile.get("google", False)
             canvas_complete = profile.get("canvas", False)
             
-            if google_complete and canvas_complete:
-                # Both integrations complete - mark onboarding as completed
+            if google_complete or canvas_complete:
+                # At least one integration complete - mark onboarding as completed
                 await self._complete_onboarding_with_integrations(user_id)
-                logger.info(f"Auto-completed onboarding for user {user_id} - both integrations done")
+                logger.info(f"Auto-completed onboarding for user {user_id} - at least one integration done (Google: {google_complete}, Canvas: {canvas_complete})")
                 return True
             else:
                 logger.info(f"User {user_id} integrations not complete - Google: {google_complete}, Canvas: {canvas_complete}")
