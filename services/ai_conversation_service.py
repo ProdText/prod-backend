@@ -3,7 +3,8 @@ import os
 import logging
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import re
 
 from supabase import Client
 import tiktoken
@@ -12,19 +13,25 @@ import tiktoken
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Anthropic client with error handling
+# Anthropic client will be initialized lazily
 anthropic = None
-api_key = os.getenv("ANTHROPIC_API_KEY")
-if api_key:
-    try:
-        from anthropic import Anthropic
-        anthropic = Anthropic(api_key=api_key)
-        logger.info("Anthropic client initialized successfully")
-    except Exception as e:
-        logger.warning(f"Failed to initialize Anthropic client: {e}")
-        logger.warning("AI functionality will be limited")
-else:
-    logger.warning("ANTHROPIC_API_KEY not found - AI functionality will be limited")
+
+def _get_anthropic_client():
+    """Get or initialize the Anthropic client"""
+    global anthropic
+    if anthropic is None:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if api_key:
+            try:
+                from anthropic import Anthropic
+                anthropic = Anthropic(api_key=api_key)
+                logger.info("Anthropic client initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Anthropic client: {e}")
+                logger.warning("AI functionality will be limited")
+        else:
+            logger.warning("ANTHROPIC_API_KEY not found - AI functionality will be limited")
+    return anthropic
 
 
 @dataclass
@@ -41,6 +48,102 @@ class AIConversationService:
         self.supabase = supabase_client
         self.max_tokens = max_tokens
         self.encoding = tiktoken.get_encoding("cl100k_base")  # GPT-4 encoding
+        self.google_integration = None  # Will be set when needed
+    
+    async def _parse_and_execute_function(
+        self, 
+        ai_response: str, 
+        user_id: str, 
+        phone_number: str
+    ) -> Optional[str]:
+        """
+        Parse AI response for function calls and execute them
+        
+        Returns:
+            Result message if a function was executed, None otherwise
+        """
+        try:
+            # Look for JSON block in the response
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', ai_response, re.DOTALL)
+            if not json_match:
+                return None
+            
+            function_call = json.loads(json_match.group(1))
+            function_name = function_call.get('function')
+            params = function_call.get('params', {})
+            
+            # Initialize Google integration
+            from services.google_integration_service import GoogleIntegrationService
+            google_service = GoogleIntegrationService(self.supabase, phone_number)
+            
+            if function_name == 'DRAFT_EMAIL':
+                result = await google_service.draft_email(
+                    to=params.get('to', []),
+                    subject=params.get('subject', 'No Subject'),
+                    body=params.get('body', '')
+                )
+                return "I've created the email draft for you" if result['success'] else f"Failed to create draft: {result.get('error')}"
+            
+            elif function_name == 'SEND_EMAIL':
+                result = await google_service.send_email(
+                    to=params.get('to', []),
+                    subject=params.get('subject', 'No Subject'),
+                    body=params.get('body', '')
+                )
+                return "Email sent successfully" if result['success'] else f"Failed to send: {result.get('error')}"
+            
+            elif function_name == 'CREATE_CALENDAR_EVENT':
+                # Parse datetime strings from params
+                start_time = datetime.fromisoformat(params.get('start_time', ''))
+                end_time = datetime.fromisoformat(params.get('end_time', ''))
+                
+                result = await google_service.create_calendar_event(
+                    title=params.get('title', 'New Event'),
+                    start_time=start_time,
+                    end_time=end_time,
+                    description=params.get('description'),
+                    location=params.get('location'),
+                    attendees=params.get('attendees', [])
+                )
+                return result.get('message') if result['success'] else f"Failed to create event: {result.get('error')}"
+            
+            return None
+            
+        except json.JSONDecodeError:
+            logger.debug("No valid JSON function call found in response")
+            return None
+        except Exception as e:
+            logger.error(f"Error executing function: {str(e)}")
+            return f"I encountered an error executing that action: {str(e)}"
+    
+    async def _draft_email_with_ai(self, recipient: str, subject: str, context: str) -> str:
+        """
+        Use AI to draft a professional email based on context
+        """
+        client = _get_anthropic_client()
+        if not client:
+            return "I'm unable to draft emails at the moment."
+        
+        try:
+            email_prompt = f"""Draft a professional email to {recipient} with subject: {subject}
+            
+Context/Requirements: {context}
+
+Write a clear, professional email. Keep it concise but complete. Include appropriate greeting and closing."""
+            
+            response = client.messages.create(
+                model="claude-3-5-haiku-latest",
+                max_tokens=1000,
+                temperature=0.7,
+                system="You are an expert email writer. Draft professional, clear, and concise emails.",
+                messages=[{"role": "user", "content": email_prompt}]
+            )
+            
+            return response.content[0].text
+            
+        except Exception as e:
+            logger.error(f"Error drafting email: {str(e)}")
+            return "I encountered an error while drafting the email."
         
     async def handle_ai_conversation(
         self, 
@@ -83,8 +186,18 @@ class AIConversationService:
             # Generate AI response (returns list of strings)
             ai_responses = await self._generate_ai_response(conversation_history)
             
-            # Join the responses back into a single string for storage and return
+            # Join the responses back into a single string for storage
             full_ai_response = ". ".join(ai_responses)
+            
+            # Check if AI wants to call a function
+            function_result = await self._parse_and_execute_function(
+                full_ai_response, user_id, phone_number
+            )
+            
+            if function_result:
+                # Add function result to responses
+                ai_responses.append(function_result)
+                full_ai_response = ". ".join(ai_responses)
             
             # Add AI response to history
             ai_msg = ConversationMessage(
@@ -102,6 +215,165 @@ class AIConversationService:
         except Exception as e:
             logger.error(f"Error in AI conversation for user {user_id}: {str(e)}")
             return ["I'm sorry, I'm having trouble processing your message right now. Please try again."]
+    
+    async def _store_intent(self, user_id: str, intent: Dict[str, Any]) -> None:
+        """Store an intent for follow-up processing"""
+        try:
+            # Store in user metadata or a temporary field
+            self.supabase.table("user_profiles").update({
+                "pending_intent": json.dumps(intent)
+            }).eq("id", user_id).execute()
+        except Exception as e:
+            logger.error(f"Error storing intent: {str(e)}")
+    
+    async def _get_stored_intent(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get stored intent if any"""
+        try:
+            result = self.supabase.table("user_profiles").select(
+                "pending_intent"
+            ).eq("id", user_id).single().execute()
+            
+            if result.data and result.data.get("pending_intent"):
+                return json.loads(result.data["pending_intent"])
+            return None
+        except Exception as e:
+            logger.error(f"Error getting stored intent: {str(e)}")
+            return None
+    
+    async def _clear_stored_intent(self, user_id: str) -> None:
+        """Clear stored intent after processing"""
+        try:
+            self.supabase.table("user_profiles").update({
+                "pending_intent": None
+            }).eq("id", user_id).execute()
+        except Exception as e:
+            logger.error(f"Error clearing intent: {str(e)}")
+    
+    async def _handle_stored_intent(
+        self, 
+        user_id: str, 
+        phone_number: str,
+        intent: Dict[str, Any], 
+        user_message: str,
+        conversation_history: List[ConversationMessage]
+    ) -> Optional[List[str]]:
+        """Handle a stored intent with follow-up information"""
+        try:
+            from services.google_integration_service import GoogleIntegrationService
+            
+            # Initialize Google integration if needed
+            if not self.google_integration:
+                self.google_integration = GoogleIntegrationService(self.supabase, phone_number)
+            
+            if intent['action'] == 'draft_email':
+                # Check if we have enough info to draft
+                if 'subject' in user_message.lower() or 'about' in user_message.lower():
+                    # Extract subject and body from conversation
+                    subject = self._extract_subject_from_conversation(conversation_history)
+                    body_context = user_message
+                    
+                    # Draft the email
+                    draft_body = await self._draft_email_with_ai(
+                        intent['params']['recipient'],
+                        subject,
+                        body_context
+                    )
+                    
+                    # Create draft via Google integration
+                    result = await self.google_integration.draft_email(
+                        to=[intent['params']['recipient']],
+                        subject=subject,
+                        body=draft_body
+                    )
+                    
+                    # Clear the intent
+                    await self._clear_stored_intent(user_id)
+                    
+                    if result['success']:
+                        return ["I've drafted the email for you. Would you like me to send it or make any changes"]
+                    else:
+                        return [f"I had trouble creating the draft: {result['error']}"]
+            
+            elif intent['action'] == 'schedule_event':
+                # Parse time and date from the follow-up
+                if any(word in user_message.lower() for word in ['tomorrow', 'today', 'monday', 'tuesday']):
+                    # Extract event details
+                    event_time = self._parse_event_time(user_message)
+                    
+                    if event_time:
+                        result = await self.google_integration.create_calendar_event(
+                            title=intent['params']['event_description'],
+                            start_time=event_time['start'],
+                            end_time=event_time['end'],
+                            description=user_message
+                        )
+                        
+                        # Clear the intent
+                        await self._clear_stored_intent(user_id)
+                        
+                        if result['success']:
+                            return [result['message']]
+                        else:
+                            return [f"I couldn't create the event: {result['error']}"]
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error handling stored intent: {str(e)}")
+            return None
+    
+    def _extract_subject_from_conversation(self, conversation: List[ConversationMessage]) -> str:
+        """Extract email subject from conversation context"""
+        # Look for subject mentions in recent messages
+        for msg in reversed(conversation[-5:]):
+            if 'about' in msg.content.lower():
+                # Extract what comes after "about"
+                parts = msg.content.lower().split('about')
+                if len(parts) > 1:
+                    return parts[1].strip()[:50]  # Limit subject length
+        return "Follow-up from our conversation"
+    
+    def _parse_event_time(self, message: str) -> Optional[Dict[str, datetime]]:
+        """Parse event time from message"""
+        try:
+            now = datetime.now()
+            message_lower = message.lower()
+            
+            # Simple parsing - you'd want to use a library like dateutil for production
+            if 'tomorrow' in message_lower:
+                event_date = now + timedelta(days=1)
+            elif 'today' in message_lower:
+                event_date = now
+            else:
+                return None
+            
+            # Default to 1 hour meeting at 2pm if no time specified
+            start_time = event_date.replace(hour=14, minute=0, second=0, microsecond=0)
+            end_time = start_time + timedelta(hours=1)
+            
+            # Look for time mentions
+            time_patterns = [
+                (r'(\d{1,2})\s*(?:pm|p\.m\.)', 12),  # PM times
+                (r'(\d{1,2})\s*(?:am|a\.m\.)', 0),    # AM times
+            ]
+            
+            for pattern, offset in time_patterns:
+                match = re.search(pattern, message_lower)
+                if match:
+                    hour = int(match.group(1))
+                    if offset == 12 and hour != 12:
+                        hour += 12
+                    elif offset == 0 and hour == 12:
+                        hour = 0
+                    start_time = start_time.replace(hour=hour)
+                    end_time = start_time + timedelta(hours=1)
+                    break
+            
+            return {'start': start_time, 'end': end_time}
+            
+        except Exception as e:
+            logger.error(f"Error parsing event time: {str(e)}")
+            return None
     
     async def _get_conversation_history(self, user_id: str) -> List[ConversationMessage]:
         """Retrieve conversation history for user from user_profiles table"""
@@ -176,13 +448,33 @@ class AIConversationService:
             # Prepare messages for AI API
             messages = []
             
-            # Add system prompt
+            # Add system prompt with function calling
             system_prompt = """You are a helpful AI assistant that is conversational and responds like a human that is texting someone. 
 You can help users with questions, provide information, and have natural conversations.
 Keep your responses concise and friendly, suitable for text messaging.
-If users ask about technical integrations or account features, direct them to their dashboard.
 If you want to send multiple text messages to shorten up a message, use a period. In the very last sentence do not use a period. Only generate 3 sentences MAX.
-Normally there should be one or two messages."""
+Normally there should be one or two messages.
+
+You have access to these functions:
+- CREATE_CALENDAR_EVENT: Schedule meetings, appointments, reminders
+- DRAFT_EMAIL: Create email drafts for the user to review
+- SEND_EMAIL: Send emails directly (always confirm before sending)
+
+When users ask you to perform these actions, gather the necessary information naturally through conversation.
+
+To use a function, respond with a JSON block like this:
+```json
+{
+  "function": "DRAFT_EMAIL",
+  "params": {
+    "to": ["john@example.com"],
+    "subject": "Meeting Tomorrow",
+    "body": "Hi John, ..."
+  }
+}
+```
+
+Only output the JSON when you have all required information. Otherwise, ask for what you need conversationally."""
                         
             # Add conversation history
             for msg in conversation_history:
@@ -192,12 +484,13 @@ Normally there should be one or two messages."""
                 })
             
             # Check if Anthropic client is available
-            if not anthropic:
+            client = _get_anthropic_client()
+            if not client:
                 logger.error("Anthropic API key not configured")
                 return ["I'm sorry, AI functionality is not configured. Please contact support."]
             
             # Call Anthropic API
-            response = anthropic.messages.create(
+            response = client.messages.create(
                 model="claude-3-5-haiku-latest",
                 max_tokens=5000,
                 temperature=0.5,
