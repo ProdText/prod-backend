@@ -1,26 +1,30 @@
-import logging
 import json
 import os
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+import logging
 from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
+
 from supabase import Client
 import tiktoken
-from anthropic import Anthropic
-from dotenv import load_dotenv
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Get API key and setup Anthropic client
-api_key = os.environ.get("ANTHROPIC_API_KEY")
-if not api_key:
-    logger.warning("ANTHROPIC_API_KEY not found - AI functionality will be limited")
-    anthropic = None
+# Initialize Anthropic client with error handling
+anthropic = None
+api_key = os.getenv("ANTHROPIC_API_KEY")
+if api_key:
+    try:
+        from anthropic import Anthropic
+        anthropic = Anthropic(api_key=api_key)
+        logger.info("Anthropic client initialized successfully")
+    except Exception as e:
+        logger.warning(f"Failed to initialize Anthropic client: {e}")
+        logger.warning("AI functionality will be limited")
 else:
-    anthropic = Anthropic(api_key=api_key)
+    logger.warning("ANTHROPIC_API_KEY not found - AI functionality will be limited")
 
 
 @dataclass

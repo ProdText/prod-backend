@@ -1,0 +1,58 @@
+{
+  "family": "amygdala-backend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::228966250798:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "amygdala-backend",
+      "image": "228966250798.dkr.ecr.us-east-2.amazonaws.com/amygdala-backend:latest",
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "SUPABASE_URL",
+          "valueFrom": "arn:aws:ssm:us-east-2:228966250798:parameter/amygdala/supabase-url"
+        },
+        {
+          "name": "SUPABASE_SERVICE_ROLE_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-2:228966250798:parameter/amygdala/supabase-service-role-key"
+        },
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-2:228966250798:parameter/amygdala/anthropic-api-key"
+        },
+        {
+          "name": "BLUEBUBBLES_SERVER_URL",
+          "valueFrom": "arn:aws:ssm:us-east-2:228966250798:parameter/amygdala/bluebubbles-api-url"
+        },
+        {
+          "name": "BLUEBUBBLES_SERVER_PASSWORD",
+          "valueFrom": "arn:aws:ssm:us-east-2:228966250798:parameter/amygdala/bluebubbles-password"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/amygdala-backend",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8000/healthz || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "essential": true
+    }
+  ]
+}
