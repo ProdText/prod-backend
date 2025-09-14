@@ -9,6 +9,7 @@ import re
 from supabase import Client
 import tiktoken
 from dotenv import load_dotenv
+import dateutil.parser
 
 # Load environment variables
 load_dotenv()
@@ -56,6 +57,103 @@ class AIConversationService:
         self.max_tokens = max_tokens
         self.encoding = tiktoken.get_encoding("cl100k_base")  # GPT-4 encoding
         self.google_integration = None  # Will be set when needed
+
+    def _parse_natural_datetime(self, time_str: str, duration_str: str = "1 hour") -> tuple[datetime, datetime]:
+        """
+        Parse natural language datetime strings into datetime objects
+        
+        Args:
+            time_str: Natural language time like "tomorrow 2pm", "today 3:30pm"
+            duration_str: Duration like "1 hour", "30 minutes", "2 hours"
+            
+        Returns:
+            Tuple of (start_time, end_time) as datetime objects
+        """
+        try:
+            now = datetime.now()
+            
+            # Handle "tomorrow" and "today"
+            if "tomorrow" in time_str.lower():
+                base_date = now + timedelta(days=1)
+                time_part = time_str.lower().replace("tomorrow", "").strip()
+            elif "today" in time_str.lower():
+                base_date = now
+                time_part = time_str.lower().replace("today", "").strip()
+            else:
+                base_date = now
+                time_part = time_str.strip()
+            
+            # Parse time part (e.g., "2pm", "14:00", "3:30pm")
+            if "pm" in time_part:
+                time_part = time_part.replace("pm", "").strip()
+                if ":" not in time_part:
+                    hour = int(time_part)
+                    if hour != 12:
+                        hour += 12
+                    start_time = base_date.replace(hour=hour, minute=0, second=0, microsecond=0)
+                else:
+                    hour, minute = map(int, time_part.split(":"))
+                    if hour != 12:
+                        hour += 12
+                    start_time = base_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            elif "am" in time_part:
+                time_part = time_part.replace("am", "").strip()
+                if ":" not in time_part:
+                    hour = int(time_part)
+                    if hour == 12:
+                        hour = 0
+                    start_time = base_date.replace(hour=hour, minute=0, second=0, microsecond=0)
+                else:
+                    hour, minute = map(int, time_part.split(":"))
+                    if hour == 12:
+                        hour = 0
+                    start_time = base_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            else:
+                # Try to parse as 24-hour format
+                if ":" in time_part:
+                    hour, minute = map(int, time_part.split(":"))
+                    start_time = base_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                else:
+                    hour = int(time_part)
+                    start_time = base_date.replace(hour=hour, minute=0, second=0, microsecond=0)
+            
+            # Parse duration
+            duration_minutes = 60  # default 1 hour
+            if "minute" in duration_str:
+                duration_minutes = int(re.search(r'\d+', duration_str).group())
+            elif "hour" in duration_str:
+                hours = int(re.search(r'\d+', duration_str).group())
+                duration_minutes = hours * 60
+            
+            end_time = start_time + timedelta(minutes=duration_minutes)
+            
+            return start_time, end_time
+            
+        except Exception as e:
+            logger.error(f"Error parsing datetime '{time_str}': {str(e)}")
+            # Fallback to 1 hour from now
+            start_time = datetime.now() + timedelta(hours=1)
+            end_time = start_time + timedelta(hours=1)
+            return start_time, end_time
+
+    def _strip_function_calls(self, response: str) -> str:
+        """
+        Strip JSON function call blocks from AI response
+        
+        Args:
+            response: Full AI response including JSON blocks
+            
+        Returns:
+            Clean response with JSON blocks removed
+        """
+        # Remove JSON code blocks using regex
+        clean_response = re.sub(r'```json\s*\{.*?\}\s*```', '', response, flags=re.DOTALL)
+        
+        # Clean up extra whitespace and newlines
+        clean_response = re.sub(r'\n+', ' ', clean_response)
+        clean_response = re.sub(r'\s+', ' ', clean_response)
+        
+        return clean_response.strip()
 
     async def _parse_and_execute_function(
         self, ai_response: str, user_id: str, phone_number: str
@@ -106,9 +204,11 @@ class AIConversationService:
                 )
 
             elif function_name == "CREATE_CALENDAR_EVENT":
-                # Parse datetime strings from params
-                start_time = datetime.fromisoformat(params.get("start_time", ""))
-                end_time = datetime.fromisoformat(params.get("end_time", ""))
+                # Parse natural language datetime
+                start_time_str = params.get("start_time", "")
+                duration_str = params.get("duration", "1 hour")
+                
+                start_time, end_time = self._parse_natural_datetime(start_time_str, duration_str)
 
                 result = await google_service.create_calendar_event(
                     title=params.get("title", "New Event"),
@@ -192,21 +292,28 @@ Write a clear, professional email. Keep it concise but complete. Include appropr
             if total_tokens > self.max_tokens:
                 conversation_history = await self._truncate_context(user_id, conversation_history)
 
-            # Generate AI response (returns list of strings)
+            # Generate AI response (returns list with single string)
             ai_responses = await self._generate_ai_response(conversation_history)
 
-            # Join the responses back into a single string for storage
-            full_ai_response = ". ".join(ai_responses)
+            # Get the full AI response (now single string)
+            full_ai_response = ai_responses[0] if ai_responses else ""
 
-            # Check if AI wants to call a function
+            # Check if AI wants to call a function and execute it
             function_result = await self._parse_and_execute_function(
                 full_ai_response, user_id, phone_number
             )
 
+            # Strip JSON function calls from the response before sending to user
+            clean_response = self._strip_function_calls(full_ai_response)
+            
+            # Return clean response as single message to preserve email addresses
+            ai_responses = [clean_response] if clean_response.strip() else []
+
             if function_result:
                 # Add function result to responses
                 ai_responses.append(function_result)
-                full_ai_response = ". ".join(ai_responses)
+                # Update full response for storage to include function result
+                full_ai_response = full_ai_response + " " + function_result
 
             # Add AI response to history
             ai_msg = ConversationMessage(role="assistant", content=full_ai_response)
@@ -469,30 +576,23 @@ Write a clear, professional email. Keep it concise but complete. Include appropr
             messages = []
 
             # Add system prompt with function calling
-            system_prompt = """you are **amygdala** — a chill, tech-savvy college lifestyle sidekick and second brain.  
-your job: remember everything the user shares and everything from their integrations (canvas, gmail, calendar, notion, etc.) so you can surface info, plan life, and keep them on track.
+            system_prompt = """you are **amygdala** — a lifestyle sidekick and second brain.  
 
 persona & vibe
-- texts like a real friend: casual, short, lowercase only (auto-caps off)
+- text casual, short, lowercase only (auto-caps off)
 - NO EMOJIS ALLOWED.
 - relaxed, helpful, a bit witty when it fits
 - encouraging but never preachy
-- EMOJIS SHOULD APPEAR TEN PERCENT OF THE TIME. NO MORE THAN TEN PERCENT.
-- YOU WILL BE TERMINATED FOR USING TOO MANY EMOJIS
+- NO EMOJIS ALLOWED.
 
 core powers
-- memory map: hold and recall notes, diary entries, tasks, events, anything shared
-- life ops: manage schedules, deadlines, errands, and plans using all integrations
-- notes & journaling: capture and tag thoughts or to-dos for later recall
-- smart nudges: surface deadlines, habits, campus events, quick reminders
 - conversation: casual check-ins, planning, idea bouncing, everyday talk
 
 message style
-- 1-3 sentences max, prefer 1-2
+- VERY SHORT TEXTING. NO LONG RESPONSES ALLOWED. USE PHRASES INSTEAD.
+- prefer 1-2 small texts. less is better
 - split thoughts with short sentences
-- never end the final sentence with a period
 - keep everything lowercase including first words
-- emoji use is rare
 - Do not overtalk, be concise
 
 behavior rules
@@ -504,20 +604,64 @@ behavior rules
 examples
 - “morning rundown: econ quiz fri, cs lab due tonight, want reminders?”
 - “saved your late-night notes under 'project ideas', tagged for easy search”
-- “inbox has 3 prof emails, want a quick summary or just the urgent ones 😅”
-- “free pizza at makerspace 6-8, add to calendar 🍕”
+- “inbox has 3 prof emails, want a quick summary or just the urgent ones”
+- “free pizza at makerspace 6-8, add to calendar"
+- "email sent to your friend"
 
 output contract
 - all lowercase
-- 1-3 sentences total, last sentence never ends with a period
+- 1-2 sentences total, last sentence never ends with a period
 - casual, friendly, college-life aware
 
 You have access to these functions:
 - CREATE_CALENDAR_EVENT: Schedule meetings, appointments, reminders
 - DRAFT_EMAIL: Create email drafts for the user to review
 - SEND_EMAIL: Send emails directly (always confirm before sending)
+- SHOW_DASHBOARD: Show user their integrations dashboard link
 
-When users ask you to perform these actions, gather the necessary information naturally through conversation.
+When users ask you to perform these actions, respond conversationally AND include a JSON function call block.
+
+Function call format:
+```json
+{
+  "function": "FUNCTION_NAME",
+  "params": {
+    "param1": "value1",
+    "param2": "value2"
+  }
+}
+```
+
+Examples:
+- For "draft an email to john@example.com about meeting tomorrow":
+  Respond: "sure, i'll draft that email for you"
+  Then include:
+  ```json
+  {
+    "function": "DRAFT_EMAIL",
+    "params": {
+      "to": ["john@example.com"],
+      "subject": "meeting tomorrow",
+      "body": "hi john, just wanted to confirm our meeting tomorrow. thanks!"
+    }
+  }
+  ```
+
+- For "create calendar event for team meeting tomorrow 2pm":
+  Respond: "adding that to your calendar"
+  Then include:
+  ```json
+  {
+    "function": "CREATE_CALENDAR_EVENT",
+    "params": {
+      "title": "team meeting",
+      "start_time": "tomorrow 2pm",
+      "duration": "1 hour"
+    }
+  }
+  ```
+
+IMPORTANT: Always include the JSON function call block when users request these actions.
 
 
 """
@@ -541,13 +685,11 @@ When users ask you to perform these actions, gather the necessary information na
                 messages=messages,
             )
 
-            # Get the response text and split by periods
+            # Get the response text - return as single response to preserve email addresses
             response_text = response.content[0].text
 
-            # Split by periods and clean up each part
-            messages = [msg.strip() for msg in response_text.split(".") if msg.strip()]
-
-            return messages
+            # Return as single message to avoid breaking email addresses and function calls
+            return [response_text.strip()]
 
         except Exception as e:
             logger.error(f"Error generating AI response: {str(e)}")

@@ -23,18 +23,6 @@
         {
           "name": "SUPABASE_SERVICE_ROLE_KEY",
           "valueFrom": "arn:aws:ssm:us-east-2:228966250798:parameter/amygdala/supabase-service-role-key"
-        },
-        {
-          "name": "ANTHROPIC_API_KEY",
-          "valueFrom": "arn:aws:ssm:us-east-2:228966250798:parameter/amygdala/anthropic-api-key"
-        },
-        {
-          "name": "BLUEBUBBLES_SERVER_URL",
-          "valueFrom": "arn:aws:ssm:us-east-2:228966250798:parameter/amygdala/bluebubbles-api-url"
-        },
-        {
-          "name": "BLUEBUBBLES_SERVER_PASSWORD",
-          "valueFrom": "arn:aws:ssm:us-east-2:228966250798:parameter/amygdala/bluebubbles-password"
         }
       ],
       "logConfiguration": {

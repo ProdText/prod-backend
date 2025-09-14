@@ -24,22 +24,44 @@ class GoogleIntegrationService:
             return self._google_account
             
         try:
-            # Get user profile
-            result = self.supabase.table('user_profiles').select('*').eq('phone_number', self.user_guid).single().execute()
-            if not result.data:
+            # Get user profile - handle both phone_number and user_id formats
+            user_profile = None
+            
+            # Try phone_number first (for production)
+            try:
+                result = self.supabase.table('user_profiles').select('*').eq('phone_number', self.user_guid).execute()
+                if result.data and len(result.data) > 0:
+                    user_profile = result.data[0]
+            except Exception as e:
+                logger.debug(f"Phone number lookup failed: {str(e)}")
+            
+            # If no profile found by phone, try direct user_id lookup (for testing)
+            if not user_profile:
+                try:
+                    result = self.supabase.table('user_profiles').select('*').eq('id', self.user_guid).execute()
+                    if result.data and len(result.data) > 0:
+                        user_profile = result.data[0]
+                except Exception as e:
+                    logger.debug(f"User ID lookup failed: {str(e)}")
+            
+            if not user_profile:
                 logger.warning(f"No user profile found for {self.user_guid}")
                 return None
             
-            user_id = result.data['id']
+            user_id = user_profile['id']
             
             # Get Google account
-            result = self.supabase.table('google_accounts').select('*').eq('user_id', user_id).single().execute()
-            if not result.data:
-                logger.warning(f"No Google account linked for user {user_id}")
+            try:
+                result = self.supabase.table('google_accounts').select('*').eq('user_id', user_id).execute()
+                if not result.data or len(result.data) == 0:
+                    logger.warning(f"No Google account linked for user {user_id}")
+                    return None
+                
+                self._google_account = result.data[0]
+                return self._google_account
+            except Exception as e:
+                logger.warning(f"Google account lookup failed for user {user_id}: {str(e)}")
                 return None
-            
-            self._google_account = result.data
-            return self._google_account
             
         except Exception as e:
             logger.error(f"Error getting Google account: {str(e)}")

@@ -726,6 +726,16 @@ class MessageProcessor:
         try:
             logger.info(f"Handling AI conversation for user {user_with_profile.profile.id}")
             
+            # Check for dashboard keywords first
+            dashboard_keywords = ["dashboard", "integrations", "dashboard link", "integrations link", "dashabord"]
+            if any(keyword in user_message.lower() for keyword in dashboard_keywords):
+                dashboard_url = f"https://www.tryamygdala.tech/{user_with_profile.profile.id}"
+                return [
+                    "here's your integrations dashboard:",
+                    dashboard_url,
+                    "you can manage all your connected services there"
+                ]
+            
             # Use the AI conversation service to generate response with context
             ai_response = await self.ai_conversation_service.handle_ai_conversation(
                 user_id=user_with_profile.profile.id,

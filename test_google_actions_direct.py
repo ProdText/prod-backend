@@ -19,13 +19,16 @@ load_dotenv()
 
 async def test_gmail_draft_creation():
     """Test Gmail draft creation through AI function calling"""
-    print("🧪 Testing Gmail Draft Creation with AI Function Calling")
-    print("=" * 60)
+    # Create a test user ID (you can replace with a real user ID from your database)
+    test_user_id = "test-user-123"
+    test_phone = "+15551234567"
     
     # Initialize services
     supabase_client = get_supabase_client()
-    google_service = GoogleIntegrationService(supabase_client, test_user_id)
-    ai_service = AIConversationService(google_integration_service=google_service)
+    ai_service = AIConversationService(supabase_client)
+    
+    print("🧪 Testing Gmail Draft Creation with AI Function Calling")
+    print("=" * 60)
     
     # Test user message requesting email draft
     user_message = """Can you draft an email to john@example.com with subject "Meeting Tomorrow" and message "Hi John, just wanted to confirm our meeting tomorrow at 2pm. Thanks!" """
@@ -71,8 +74,7 @@ async def test_gmail_send_email():
     
     # Initialize services
     supabase_client = get_supabase_client()
-    google_service = GoogleIntegrationService(supabase_client, test_user_id)
-    ai_service = AIConversationService(google_integration_service=google_service)
+    ai_service = AIConversationService(supabase_client)
     
     # Test user message requesting email send
     user_message = """Please send an email to jane@example.com with subject "Project Update" and message "Hi Jane, the project is on track for completion next week. Best regards!" """
@@ -113,8 +115,7 @@ async def test_calendar_event_creation():
     
     # Initialize services
     supabase_client = get_supabase_client()
-    google_service = GoogleIntegrationService(supabase_client, test_user_id)
-    ai_service = AIConversationService(google_integration_service=google_service)
+    ai_service = AIConversationService(supabase_client)
     
     # Test user message requesting calendar event
     user_message = """Can you create a calendar event for "Team Meeting" tomorrow at 2pm for 1 hour? """
