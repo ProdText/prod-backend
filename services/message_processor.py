@@ -5,6 +5,7 @@ from models.auth_user import AuthUserWithProfile, UserProfile
 from services.auth_user_service import AuthUserService
 from services.bluebubbles_client import BlueBubblesClient
 from services.onboarding_service import OnboardingService, OnboardingState
+from services.ai_conversation_service import AIConversationService
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,7 @@ class MessageProcessor:
         self.auth_user_service = auth_user_service
         self.bluebubbles_client = bluebubbles_client
         self.onboarding_service = OnboardingService(auth_user_service)
+        self.ai_conversation_service = AIConversationService(auth_user_service.supabase)
     
     async def process_webhook_message(self, payload: WebhookPayload) -> MessageResponse:
         """
@@ -73,8 +75,11 @@ class MessageProcessor:
             if existing_user:
                 # Check if user has completed email verification
                 if existing_user.profile.email_verified and existing_user.profile.onboarding_completed:
-                    # Fully verified existing user - placeholder response
-                    response_text = "Feature to be implemented"
+                    # Fully verified existing user - handle AI conversation
+                    response_texts = await self._handle_ai_conversation(
+                        existing_user, message_data.text, phone_number
+                    )
+
                 else:
                     # Existing user but not verified - continue onboarding workflow
                     response_text = await self._handle_existing_user_workflow(message_data, existing_user, phone_number, chat_identifier)
@@ -82,16 +87,24 @@ class MessageProcessor:
                 # New user - handle onboarding workflow
                 response_text = await self._handle_new_user_workflow(message_data, user_guid, phone_number, chat_identifier)
             
-            if response_text:
-                # Send response via BlueBubbles
+            # Handle responses (could be single string or list of strings)
+            responses_to_send = []
+            if isinstance(response_texts, list):
+                responses_to_send = response_texts
+            elif response_text:
+                responses_to_send = [response_text]
+            
+            if responses_to_send:
+                # Send responses via BlueBubbles
                 chat_identifier = self._extract_chat_identifier(message_data)
                 if chat_identifier:
                     try:
-                        await self.bluebubbles_client.send_text_message(
-                            chat_guid=chat_identifier,
-                            text=response_text
-                        )
-                        logger.info(f"Sent response to user {user_guid}")
+                        for response in responses_to_send:
+                            await self.bluebubbles_client.send_text_message(
+                                chat_guid=chat_identifier,
+                                text=response
+                            )
+                        logger.info(f"Sent {len(responses_to_send)} response(s) to user {user_guid}")
                     except Exception as e:
                         logger.error(f"Failed to send response: {str(e)}")
                         raise Exception(f"Failed to send response: {str(e)}")
@@ -488,3 +501,36 @@ class MessageProcessor:
         except Exception as e:
             logger.error(f"Error completing onboarding: {str(e)}")
             raise
+
+    async def _handle_ai_conversation(
+        self, 
+        user_with_profile: AuthUserWithProfile, 
+        user_message: str, 
+        phone_number: str
+    ) -> List[str]:
+        """
+        Handle AI conversation for fully verified users
+        
+        Args:
+            user_with_profile: Authenticated user with profile
+            user_message: The user's message text
+            phone_number: User's phone number for logging
+            
+        Returns:
+            List of AI response strings
+        """
+        try:
+            logger.info(f"Handling AI conversation for user {user_with_profile.profile.id}")
+            
+            # Use the AI conversation service to generate response with context
+            ai_response = await self.ai_conversation_service.handle_ai_conversation(
+                user_id=user_with_profile.profile.id,
+                user_message=user_message,
+                phone_number=phone_number
+            )
+            
+            return ai_response
+            
+        except Exception as e:
+            logger.error(f"Error in AI conversation for user {user_with_profile.profile.id}: {str(e)}")
+            return ["I'm sorry, I'm having trouble processing your message right now. Please try again in a moment."]
