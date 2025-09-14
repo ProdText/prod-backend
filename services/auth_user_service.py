@@ -76,7 +76,7 @@ class AuthUserService:
         email: str,
         chat_identifier: Optional[str] = None
     ) -> AuthUserWithProfile:
-        """Create a new authenticated user with profile using real email address"""
+        """Create a new authenticated user with profile using real email address - with concurrency safety"""
         try:
             if not phone_number:
                 raise Exception("Phone number is required for user creation")
@@ -84,45 +84,121 @@ class AuthUserService:
             if not email:
                 raise Exception("Email is required for user creation")
             
+            # Check for existing user by phone or email first (prevents race conditions)
+            existing_by_phone = await self.get_user_by_phone_number(phone_number)
+            if existing_by_phone:
+                logger.info(f"User already exists with phone {phone_number}")
+                return existing_by_phone
+            
+            existing_by_email = await self.get_user_by_email(email)
+            if existing_by_email:
+                logger.info(f"User already exists with email {email}")
+                return existing_by_email
+            
             # Create auth user with real email address
-            auth_response = self.admin_auth.create_user({
-                "email": email,
-                "email_confirm": False,  # User must verify via OTP
-                "user_metadata": {
+            from gotrue import AdminUserAttributes
+            
+            attrs = AdminUserAttributes(
+                email=email,
+                email_confirm=False,  # User must verify via OTP
+                user_metadata={
                     "bluebubbles_guid": bluebubbles_guid,
                     "phone_number": phone_number,  # Store phone number
                     "source": "bluebubbles_webhook"
                 }
-            })
+            )
             
-            if not auth_response.user:
-                raise Exception("Failed to create auth user")
-            
-            auth_user_data = auth_response.user
-            
-            # Create user profile - handle potential trigger conflicts
             try:
-                profile_result = self.supabase.table("user_profiles").insert({
-                    "id": auth_user_data.id,
-                    "bluebubbles_guid": bluebubbles_guid,
-                    "phone_number": phone_number,
-                    "chat_identifier": chat_identifier,
-                    "interaction_count": 1,
-                    "onboarding_completed": False,
-                    "onboarding_state": "not_started",
-                    "email_verified": False
-                }).execute()
+                auth_response = self.admin_auth.create_user(attrs)
+                
+                if not auth_response.user:
+                    raise Exception("Failed to create auth user")
+                
+                auth_user_data = auth_response.user
+            except Exception as auth_error:
+                # Handle case where user exists in auth.users but not in user_profiles
+                if "already been registered" in str(auth_error):
+                    logger.info(f"User exists in auth.users but not in profiles, attempting to link: {email}")
+                    
+                    # Try to find the existing auth user by email
+                    try:
+                        # Get user by email from Supabase auth
+                        auth_users = self.admin_auth.list_users()
+                        existing_auth_user = None
+                        
+                        for user in auth_users:
+                            if user.email == email:
+                                existing_auth_user = user
+                                break
+                        
+                        if not existing_auth_user:
+                            raise Exception(f"Could not find existing auth user for email: {email}")
+                        
+                        auth_user_data = existing_auth_user
+                        logger.info(f"Found existing auth user: {auth_user_data.id}")
+                        
+                    except Exception as find_error:
+                        logger.error(f"Failed to find existing auth user: {str(find_error)}")
+                        raise Exception(f"Email already registered but cannot access user: {str(auth_error)}")
+                else:
+                    raise auth_error
+            
+            # Handle profile creation with database trigger compatibility
+            profile_result = None
+            try:
+                # First check if profile already exists (created by database trigger)
+                existing_profile = self.supabase.table("user_profiles").select("*").eq("id", auth_user_data.id).execute()
+                
+                if existing_profile.data:
+                    # Profile exists (created by trigger), update it with our data
+                    logger.info(f"Profile exists from trigger, updating with BlueBubbles data for {auth_user_data.id}")
+                    
+                    profile_result = self.supabase.table("user_profiles").update({
+                        "bluebubbles_guid": bluebubbles_guid,
+                        "phone_number": phone_number,
+                        "email": email,
+                        "chat_identifier": chat_identifier,
+                        "interaction_count": 1,
+                        "onboarding_completed": False,
+                        "onboarding_state": "not_started",
+                        "email_verified": False
+                    }).eq("id", auth_user_data.id).execute()
+                    
+                    logger.info(f"Updated existing profile for user {auth_user_data.id}")
+                else:
+                    # No profile exists, create new one
+                    profile_result = self.supabase.table("user_profiles").insert({
+                        "id": auth_user_data.id,
+                        "bluebubbles_guid": bluebubbles_guid,
+                        "phone_number": phone_number,
+                        "email": email,
+                        "chat_identifier": chat_identifier,
+                        "interaction_count": 1,
+                        "onboarding_completed": False,
+                        "onboarding_state": "not_started",
+                        "email_verified": False
+                    }).execute()
+                    
+                    logger.info(f"Created new profile for user {auth_user_data.id}")
+                    
             except Exception as profile_error:
-                # If profile creation fails due to existing record, try to get it
-                if "already exists" in str(profile_error):
+                # Handle any remaining conflicts gracefully
+                error_msg = str(profile_error).lower()
+                if any(conflict in error_msg for conflict in ["already exists", "duplicate", "unique constraint"]):
+                    # Another request created this user concurrently, fetch existing
+                    logger.info(f"Concurrent user creation detected for {phone_number}, fetching existing")
+                    existing_user = await self.get_user_by_phone_number(phone_number)
+                    if existing_user:
+                        return existing_user
+                    
+                    # Fallback: try to get by ID
                     profile_result = self.supabase.table("user_profiles").select("*").eq("id", auth_user_data.id).execute()
                     if not profile_result.data:
-                        # If we can't find it, something is wrong
-                        raise Exception(f"Profile exists but can't be retrieved: {str(profile_error)}")
+                        raise Exception(f"Profile creation conflict but can't retrieve: {str(profile_error)}")
                 else:
                     raise profile_error
             
-            if not profile_result.data:
+            if not profile_result or not profile_result.data:
                 raise Exception("Failed to create user profile")
             
             logger.info(f"Created new authenticated user with GUID: {bluebubbles_guid}")
@@ -130,7 +206,7 @@ class AuthUserService:
             return AuthUserWithProfile(
                 auth_user=AuthUser(
                     id=auth_user_data.id,
-                    email=None,  # No email for phone-only auth
+                    email=email,  # Store email in auth user
                     phone=auth_user_data.phone,
                     created_at=auth_user_data.created_at,
                     updated_at=auth_user_data.updated_at
@@ -276,6 +352,34 @@ class AuthUserService:
             
         except Exception as e:
             logger.error(f"Error getting user by phone number {phone_number}: {str(e)}")
+            return None
+
+    async def get_user_by_email(self, email: str) -> Optional[AuthUserWithProfile]:
+        """Get authenticated user with profile by email address"""
+        try:
+            # Get user profile by email
+            profile_result = self.supabase.table("user_profiles").select("*").eq(
+                "email", email
+            ).execute()
+            
+            if not profile_result.data:
+                return None
+            
+            profile_data = profile_result.data[0]
+            user_profile = UserProfile(**profile_data)
+            
+            # Get auth user data
+            auth_user_result = self.admin_auth.get_user_by_id(profile_data["id"])
+            if not auth_user_result.user:
+                return None
+            
+            return AuthUserWithProfile(
+                auth_user=auth_user_result.user,
+                profile=user_profile
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting user by email {email}: {str(e)}")
             return None
 
     async def get_user_by_guid(self, bluebubbles_guid: str) -> Optional[AuthUserWithProfile]:
