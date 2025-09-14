@@ -17,9 +17,10 @@ load_dotenv()
 # Get API key and setup Anthropic client
 api_key = os.environ.get("ANTHROPIC_API_KEY")
 if not api_key:
-    raise ValueError("ANTHROPIC_API_KEY not found in environment variables or .env file.")
-
-anthropic = Anthropic(api_key=api_key)
+    logger.warning("ANTHROPIC_API_KEY not found - AI functionality will be limited")
+    anthropic = None
+else:
+    anthropic = Anthropic(api_key=api_key)
 
 
 @dataclass
@@ -186,6 +187,11 @@ Normally there should be one or two messages."""
                     "content": msg.content
                 })
             
+            # Check if Anthropic client is available
+            if not anthropic:
+                logger.error("Anthropic API key not configured")
+                return ["I'm sorry, AI functionality is not configured. Please contact support."]
+            
             # Call Anthropic API
             response = anthropic.messages.create(
                 model="claude-3-5-haiku-latest",
@@ -305,21 +311,14 @@ Normally there should be one or two messages."""
     async def _archive_conversation_message(
         self, 
         user_id: str, 
-        message: ConversationMessage
+        message: str
     ) -> None:
         """Archive a single conversation message to long-term storage"""
         try:
             # TODO: Implement archival to separate database/storage system
-
-
-
-
-
-
-
-
-
-
+            # For now, this is a placeholder - archival can be implemented later
+            # when we need long-term conversation storage beyond the user_profiles table
+            pass
             
         except Exception as e:
             logger.error(f"Error archiving conversation messages for user {user_id}: {str(e)}")
