@@ -6,6 +6,7 @@ from services.auth_user_service import AuthUserService
 from services.bluebubbles_client import BlueBubblesClient
 from services.onboarding_service import OnboardingService, OnboardingState
 from services.ai_conversation_service import AIConversationService
+from services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ class MessageProcessor:
         self.bluebubbles_client = bluebubbles_client
         self.onboarding_service = OnboardingService(auth_user_service)
         self.ai_conversation_service = AIConversationService(auth_user_service.supabase)
+        self.memory_service = MemoryService()
     
     async def process_webhook_message(self, payload: WebhookPayload) -> MessageResponse:
         """
@@ -79,6 +81,13 @@ class MessageProcessor:
             if existing_user:
                 # Check if user has completed BOTH email verification AND onboarding
                 if existing_user.profile.email_verified and existing_user.profile.onboarding_completed:
+                    # Ingest message to memory service for completed onboarding users
+                    await self.memory_service.ingest_message(
+                        message_id=message_data.guid,
+                        message_body=message_data.text,
+                        user_id=existing_user.profile.id
+                    )
+                    
                     # Fully verified existing user - handle AI conversation
                     response_texts = await self._handle_ai_conversation(
                         existing_user, message_data.text, phone_number
@@ -92,6 +101,13 @@ class MessageProcessor:
                     onboarding_completed = await integration_service.check_and_complete_onboarding(existing_user.profile.id)
                     
                     if onboarding_completed:
+                        # Ingest message to memory service for newly completed onboarding users
+                        await self.memory_service.ingest_message(
+                            message_id=message_data.guid,
+                            message_body=message_data.text,
+                            user_id=existing_user.profile.id
+                        )
+                        
                         # Onboarding was just completed - handle AI conversation
                         response_texts = await self._handle_ai_conversation(
                             existing_user, message_data.text, phone_number
